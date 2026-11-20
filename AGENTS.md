@@ -43,7 +43,7 @@ When Assay stops a package, report these exact fields from the JSON output to th
 - **Stop rules & reasons:** every item in `decision.stop_rules` and `decision.stop_reasons`
 - **Breaks / new reach / unexplained bytes:** `ledger.breaks`, `ledger.new_reach`, `ledger.unexplained_code_bytes`
 - **Reading summary (if run):** `reading.summary` and any `reading.findings`
-- **Human approval command:** `assay approve <first 16 hex chars of ledger.subject>`
+- **Human approval command:** `assay approve <first 16 hex chars of decision.ledger_id>`
 
 ---
 

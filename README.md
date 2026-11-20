@@ -74,7 +74,7 @@ assay explain chalk@6.0.0..6.0.1 --save-inputs && assay replay .assay/inputs/<le
 See **[docs/AGENT-GUIDE.md](docs/AGENT-GUIDE.md)**, **[AGENTS.md](AGENTS.md)**, and the drop-in skill **[skills/assay/SKILL.md](skills/assay/SKILL.md)**.
 
 1. **MCP Server (`assay mcp`):** Run `assay init --mcp` to print the ready-to-paste MCP server config exposing `assay_explain`, `assay_check`, and `assay_add`. Agents **cannot** approve stops.
-2. **Pre-Install Shell Hook:** Point your agent's `PreToolUse` Bash hook at **[scripts/pre-install-hook.sh](scripts/pre-install-hook.sh)** to automatically gate every `npm install <pkg>` command.
+2. **Pre-Install Shell Hook:** Point your agent's `PreToolUse` Bash hook at **[scripts/pre-install-hook.sh](scripts/pre-install-hook.sh)** to block raw `npm install`/`add`/`update` commands and redirect agents to `assay add <pkg> --install --json`.
 3. **Stable Machine CLI:** Every command accepts `--json` and uses strict exit codes (`0` = pass, `1` = unapproved stop, `2` = error).
 
 ---

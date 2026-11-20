@@ -490,12 +490,20 @@ pub fn extract_manifest_facts(loaded: &LoadedArchive) -> ManifestFacts {
     collect_dep_names(&val, "peerDependencies", &mut facts.peer_dependencies);
 
     for key in ["bundleDependencies", "bundledDependencies"] {
-        if let Some(arr) = val.get(key).and_then(|v| v.as_array()) {
-            for item in arr {
-                if let Some(name) = item.as_str() {
-                    facts.bundled_dependencies.insert(name.to_string());
+        match val.get(key) {
+            Some(Value::Array(arr)) => {
+                for item in arr {
+                    if let Some(name) = item.as_str() {
+                        facts.bundled_dependencies.insert(name.to_string());
+                    }
                 }
             }
+            Some(Value::Bool(true)) => {
+                for dep in &facts.runtime_dependencies {
+                    facts.bundled_dependencies.insert(dep.clone());
+                }
+            }
+            _ => {}
         }
     }
 
@@ -791,5 +799,15 @@ mod tests {
         let bad_json = make_tgz(&[("package/package.json", b"{not json", b'0')]);
         let loaded_bad = inspect_tgz(&bad_json, None, ArchiveLimits::default()).unwrap();
         assert!(loaded_bad.inventory.facts.contains(&ArchiveFact::ArchiveCorrupt));
+
+        // bundleDependencies: true must populate bundled_dependencies from dependencies.
+        let bundle_all = make_tgz(&[(
+            "package/package.json",
+            br#"{"name":"bundle-all","version":"1.0.0","dependencies":{"foo":"1.0.0"},"bundleDependencies":true}"#,
+            b'0',
+        )]);
+        let loaded_ba = inspect_tgz(&bundle_all, None, ArchiveLimits::default()).unwrap();
+        let mf_ba = extract_manifest_facts(&loaded_ba);
+        assert!(mf_ba.bundled_dependencies.contains("foo"));
     }
 }

@@ -1122,15 +1122,16 @@ fn run_check_bytes(
 
     let mut items = Vec::with_capacity(unique.len());
     let mut transition_errors = Vec::new();
+    let mut bundle_root_cache: BTreeMap<String, LoadedArchive> = BTreeMap::new();
     for (t, _paths) in unique {
         if t.in_bundle && t.new_resolved.is_none() {
-            // Only skip an `inBundle` entry if we verify its parent package archive actually
-            // declares this dependency as bundled AND physically carries `node_modules/<name>/` inside the parent tarball!
-            match verify_bundled_in_parent(&fetcher, &t, &head_pkg_map) {
+            // Only skip an `inBundle` entry if its nearest enclosing non-bundled ancestor tarball
+            // physically contains `<rel_path>/package.json` with matching name & version.
+            match verify_bundled_in_ancestor(&fetcher, &t, &head_pkg_map, &mut bundle_root_cache) {
                 Ok(true) => continue,
                 Ok(false) => {
                     transition_errors.push(format!(
-                        "{}@{} ({}): forged or unverified inBundle entry (parent archive does not bundle this package)",
+                        "{}@{} ({}): forged or unverified inBundle entry (enclosing bundle archive does not contain matching package.json)",
                         t.name,
                         t.new_version.as_deref().unwrap_or("?"),
                         t.instance_path
@@ -1139,7 +1140,7 @@ fn run_check_bytes(
                 }
                 Err(e) => {
                     transition_errors.push(format!(
-                        "{}@{} ({}): failed verifying inBundle parent: {e}",
+                        "{}@{} ({}): failed verifying inBundle ancestor: {e}",
                         t.name,
                         t.new_version.as_deref().unwrap_or("?"),
                         t.instance_path
@@ -1178,34 +1179,92 @@ fn run_check_bytes(
     Ok((items, transition_errors, all_passed))
 }
 
-/// Verifies that a nested `inBundle: true` lockfile entry is genuinely bundled inside its parent tarball.
-fn verify_bundled_in_parent(
+/// Walks up `instance_path` to find the nearest enclosing non-bundled ancestor package with a `resolved` URL,
+/// memoizes its inspected archive, and verifies that `<rel_path>/package.json` physically exists inside
+/// that bundle root tarball with matching `name` and `version`.
+fn verify_bundled_in_ancestor(
     fetcher: &Fetcher,
     t: &LockTransition,
     head_pkg_map: &BTreeMap<&str, &assay_core::lockfile::LockPackage>,
+    archive_cache: &mut BTreeMap<String, LoadedArchive>,
 ) -> Result<bool, String> {
-    let Some(parent_path) = parent_node_modules_instance(&t.instance_path) else {
+    let Some((bundle_root_path, rel_subpath)) = find_bundle_root_ancestor(&t.instance_path, head_pkg_map) else {
         return Ok(false);
     };
-    let Some(parent_pkg) = head_pkg_map.get(parent_path.as_str()) else {
+    let Some(root_pkg) = head_pkg_map.get(bundle_root_path.as_str()) else {
         return Ok(false);
     };
-    let Some(parent_url) = parent_pkg.resolved.as_deref() else {
+    let Some(root_url) = root_pkg.resolved.as_deref() else {
         return Ok(false);
     };
-    let parent_arch = fetcher.fetch_and_inspect_tarball(
-        parent_url,
-        parent_pkg.integrity.as_deref(),
-        ArchiveLimits::default(),
-    )?;
-    let parent_manifest = extract_manifest_facts(&parent_arch);
-    let declared = parent_manifest.bundled_dependencies.contains(&t.name);
-    let expected_prefix = format!("node_modules/{}/", t.name.to_ascii_lowercase());
-    let physically_present = parent_arch.contents.keys().any(|p| {
-        let rel = strip_archive_root(p).to_ascii_lowercase();
-        rel.starts_with(&expected_prefix)
-    });
-    Ok(declared && physically_present)
+
+    if !archive_cache.contains_key(&bundle_root_path) {
+        let arch = fetcher.fetch_and_inspect_tarball(
+            root_url,
+            root_pkg.integrity.as_deref(),
+            ArchiveLimits::default(),
+        )?;
+        archive_cache.insert(bundle_root_path.clone(), arch);
+    }
+    let root_arch = archive_cache.get(&bundle_root_path).unwrap();
+    Ok(archive_contains_bundled_package(
+        root_arch,
+        &rel_subpath,
+        &t.name,
+        t.new_version.as_deref(),
+    ))
+}
+
+fn find_bundle_root_ancestor(
+    instance_path: &str,
+    head_pkg_map: &BTreeMap<&str, &assay_core::lockfile::LockPackage>,
+) -> Option<(String, String)> {
+    let mut cur = instance_path.to_string();
+    while let Some(parent_path) = parent_node_modules_instance(&cur) {
+        if let Some(pkg) = head_pkg_map.get(parent_path.as_str()) {
+            if !pkg.in_bundle && pkg.resolved.is_some() {
+                let rel = instance_path
+                    .strip_prefix(&format!("{parent_path}/"))?
+                    .to_string();
+                return Some((parent_path, rel));
+            }
+        }
+        cur = parent_path;
+    }
+    None
+}
+
+fn archive_contains_bundled_package(
+    bundle_root_archive: &LoadedArchive,
+    rel_subpath: &str,
+    expected_name: &str,
+    expected_version: Option<&str>,
+) -> bool {
+    let target_pkg_json = format!("{}/package.json", rel_subpath.trim_end_matches('/'));
+    let Some((_, bytes)) = bundle_root_archive.contents.iter().find(|(p, _)| {
+        strip_archive_root(p).eq_ignore_ascii_case(&target_pkg_json)
+    }) else {
+        return false;
+    };
+    let Ok(val) =
+        serde_json::from_slice::<Value>(assay_core::archive::strip_utf8_bom(bytes))
+    else {
+        return false;
+    };
+    let name_ok = val
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|n| n == expected_name)
+        .unwrap_or(false);
+    let version_ok = match expected_version {
+        Some(ev) => val
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(|v| v == ev)
+            .unwrap_or(false),
+        None => true,
+    };
+    name_ok && version_ok
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2284,5 +2343,83 @@ mod tests {
         assert!(validate_npm_package_spec("foo bar").is_err());
         assert!(validate_npm_package_spec("zod@1.0.0\n--ignore-scripts=false").is_err());
         assert!(validate_npm_package_spec("../evil").is_err());
+    }
+
+    #[test]
+    fn verifies_deep_transitive_bundled_packages_inside_bundle_root_and_rejects_forged() {
+        use assay_core::lockfile::{LockPackage, SourceKind};
+        use assay_core::model::ArchiveInventory;
+
+        let root_pkg = LockPackage {
+            instance_path: "node_modules/npm".into(),
+            name: "npm".into(),
+            version: Some("10.9.2".into()),
+            resolved: Some("https://registry.npmjs.org/npm/-/npm-10.9.2.tgz".into()),
+            integrity: None,
+            sha512: None,
+            source_kind: SourceKind::Registry,
+            registry_host: Some("registry.npmjs.org".into()),
+            in_bundle: false,
+            dev: false,
+            optional: false,
+            dependencies: BTreeMap::new(),
+        };
+        let mid_bundled = LockPackage {
+            instance_path: "node_modules/npm/node_modules/@isaacs/cliui".into(),
+            name: "@isaacs/cliui".into(),
+            version: Some("8.0.2".into()),
+            resolved: None,
+            integrity: None,
+            sha512: None,
+            source_kind: SourceKind::Bundled,
+            registry_host: None,
+            in_bundle: true,
+            dev: false,
+            optional: false,
+            dependencies: BTreeMap::new(),
+        };
+        let mut head_map = BTreeMap::new();
+        head_map.insert(root_pkg.instance_path.as_str(), &root_pkg);
+        head_map.insert(mid_bundled.instance_path.as_str(), &mid_bundled);
+
+        let deep_path = "node_modules/npm/node_modules/@isaacs/cliui/node_modules/ansi-regex";
+        let (root_found, rel) = find_bundle_root_ancestor(deep_path, &head_map).unwrap();
+        assert_eq!(root_found, "node_modules/npm");
+        assert_eq!(rel, "node_modules/@isaacs/cliui/node_modules/ansi-regex");
+
+        let mut contents = BTreeMap::new();
+        contents.insert(
+            "package/node_modules/@isaacs/cliui/node_modules/ansi-regex/package.json".into(),
+            br#"{"name":"ansi-regex","version":"6.1.0"}"#.to_vec(),
+        );
+        let mock_archive = LoadedArchive {
+            inventory: ArchiveInventory {
+                compressed_bytes: 0,
+                expanded_bytes: 0,
+                sha512: String::new(),
+                entries: Vec::new(),
+                facts: BTreeSet::new(),
+            },
+            contents,
+        };
+
+        assert!(archive_contains_bundled_package(
+            &mock_archive,
+            &rel,
+            "ansi-regex",
+            Some("6.1.0"),
+        ));
+        assert!(!archive_contains_bundled_package(
+            &mock_archive,
+            &rel,
+            "ansi-regex",
+            Some("9.9.9"),
+        ));
+        assert!(!archive_contains_bundled_package(
+            &mock_archive,
+            "node_modules/forged-pkg",
+            "forged-pkg",
+            Some("1.0.0"),
+        ));
     }
 }

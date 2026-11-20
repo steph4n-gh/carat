@@ -5,7 +5,7 @@ Assay is built to run natively alongside coding agents (Claude Code, Codex, Curs
 There are three ways to wire Assay into an agent, and you can combine them:
 
 1. **MCP Server (`assay mcp`)** — native tool calls (`assay_explain`, `assay_check`, `assay_add`).
-2. **Pre-Install Shell Hook (`scripts/pre-install-hook.sh`)** — hard enforcement that intercepts `npm install <pkg>` even if the agent forgets to call MCP.
+2. **Pre-Install Shell Hook (`scripts/pre-install-hook.sh`)** — local guardrail that blocks raw `npm install`/`add`/`update` commands and redirects the agent to `assay add <pkg> --install --json` (real enforcement belongs in CI `assay pr` + `npm ci --ignore-scripts`).
 3. **Agent Skill (`skills/assay/SKILL.md` + `AGENTS.md`)** — teaches the agent when to run Assay, how to read JSON verdicts, and how to escalate stops cleanly.
 
 ---
@@ -122,7 +122,7 @@ All CLI commands support `--json` with deterministic, canonical JSON:
 
 ### Agent Decision Loop
 1. If `passed == true` (exit `0`): proceed.
-2. If `passed == false` (exit `1`): **stop**. List every transition where `decision.verdict == "stop"` and `approved_by == null`, include `decision.stop_reasons` and `assay approve <subject[..16]>`, and ask the user whether to approve or abort.
+2. If `passed == false` (exit `1`): **stop**. List every transition where `decision.verdict == "stop"` and `approved_by == null`, include `decision.stop_reasons` and `assay approve <decision.ledger_id[..16]>`, and ask the user whether to approve or abort.
 3. On exit `2`: report stderr verbatim and stop.
 
 ---

@@ -52,7 +52,7 @@ for seg in segments:
     idx = 0
     while idx < len(tokens):
         tok = tokens[idx]
-        if tok in ("env", "command", "nohup"):
+        if tok in ("env", "command", "nohup", "sudo"):
             idx += 1
             continue
         if "=" in tok and not tok.startswith("-"):

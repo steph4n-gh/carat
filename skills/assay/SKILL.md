@@ -29,7 +29,7 @@ Run Assay **before**:
    - Package, version transition, and dependency route
    - Every `stop_rules` / `stop_reasons` entry (e.g. `S4` break, `S5` new direct dependency, `S6` unexplained without anchor, `S7` new high/unexplained reach, `S9` fresh release)
    - Unexplained executable byte count and any reading findings/summary
-   - The exact approval command for the human: `assay approve <subject-prefix>`
+   - The exact approval command for the human: `assay approve <decision.ledger_id[..16]>`
 
 ## Strict Rules
 

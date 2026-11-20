@@ -633,8 +633,10 @@ impl Fetcher {
         );
         carat_core::store::write_atomic_no_symlink(&repo_dir.join("config"), clean_config.as_bytes())?;
 
-        // Check if commit object is already in local bare cache; if not, fetch shallow without blobs.
-        let has_commit = run_git(&repo_dir, &["cat-file", "-e", &format!("{commit}^{{commit}}")]).is_ok();
+        // Check if commit object is already in local bare cache WITHOUT triggering a promisor lazy fetch
+        // (otherwise git will pull the entire unshallow repo commit/tree graph just to answer `-e`!).
+        let has_commit =
+            run_git_no_lazy(&repo_dir, &["cat-file", "-e", &format!("{commit}^{{commit}}")]).is_ok();
         if !has_commit {
             let fetched = run_git(
                 &repo_dir,
@@ -1112,11 +1114,22 @@ fn hardened_git_cmd(cwd: Option<&Path>) -> Command {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    run_git_with_env(cwd, args, false)
+}
+
+fn run_git_no_lazy(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    run_git_with_env(cwd, args, true)
+}
+
+fn run_git_with_env(cwd: &Path, args: &[&str], no_lazy_fetch: bool) -> Result<Vec<u8>, String> {
     let abs_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let mut cmd = hardened_git_cmd(Some(&abs_cwd));
     // Explicitly pass absolute GIT_DIR for bare cache repos (except during `init`) so `safe.bareRepository=explicit` works cleanly.
     if args.first().copied() != Some("init") {
         cmd.env("GIT_DIR", &abs_cwd);
+    }
+    if no_lazy_fetch {
+        cmd.env("GIT_NO_LAZY_FETCH", "1");
     }
     let out = cmd
         .args(args)

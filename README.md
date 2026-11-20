@@ -47,7 +47,13 @@ STOP  ms 2.1.2 -> 2.1.3
 
 ## Install in 60 seconds
 
-Prerequisites: `git`, `curl`, and `npm` (plus `cargo` if building from source).
+Prerequisites: `git`, `curl`, and `npm` (plus `cargo` if installing via crates.io or source).
+
+### Cargo (crates.io)
+
+```bash
+cargo install carat
+```
 
 ### Prebuilt binary (Linux & macOS)
 

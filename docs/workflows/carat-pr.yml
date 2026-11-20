@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARAT_RELEASE_URL: "https://github.com/steph4n-gh/carat/releases/download/v0.1.0/carat-x86_64-unknown-linux-gnu.tar.gz"
-      CARAT_SHA256: "REPLACE_WITH_RELEASE_SHA256"
+      CARAT_SHA256: "84f47a9bcebfcb44a7b666570e63b299800cbd63a0e8bedb6bb775227d785d3c"
     steps:
       - name: Checkout protected base revision (never executes PR head)
         uses: actions/checkout@v4

@@ -46,8 +46,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_CONFIG_TOML: &str = include_str!("../../../carat.toml.example");
-const DEFAULT_GITHUB_WORKFLOW: &str = include_str!("../../../docs/workflows/carat-pr.yml");
+const DEFAULT_CONFIG_TOML: &str = include_str!("../assets/carat.toml.example");
+const DEFAULT_GITHUB_WORKFLOW: &str = include_str!("../assets/carat-pr.yml");
 
 #[derive(Parser)]
 #[command(name = "carat", version, about = "A balance sheet for dependency changes")]

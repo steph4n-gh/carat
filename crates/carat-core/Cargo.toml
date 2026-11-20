@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Deterministic core for Carat dependency balance sheets"
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Deterministic core for Carat npm dependency balance sheets"
 
 [dependencies]
 base64 = "0.22"

@@ -1,54 +1,95 @@
 #!/usr/bin/env bash
-# Coding-agent PreToolUse hook for Bash tool calls.
+# Coding-agent PreToolUse hook for Bash / run_command tool calls.
+# Supports both Claude Code (tool_input.command + exit 2) and Antigravity
+# (toolCall.args.CommandLine + JSON {"decision": "allow"|"deny"} on stdout).
+#
 # Blocks raw `npm install` / `npm i` / `npm add` / `npm update` calls (including wrappers and aliases)
 # so agents MUST use Carat's zero-TOCTOU single-resolution installer (`carat add <pkg> --install`)
-# or `npm ci --ignore-scripts` on an Carat-verified lockfile.
+# or `npm ci --ignore-scripts` on a Carat-verified lockfile.
 #
 # Compatible with stock macOS /bin/bash 3.2 AND bash 5+.
-# Exit 0 = allow command
-# Exit 2 = block command (agent receives stderr explaining the safe Carat command)
 set -euo pipefail
 
-PAYLOAD="$(cat)"
-
-PY_SCRIPT='
-import json, os, re, shlex, sys
-
-raw = sys.stdin.read()
-if not raw.strip():
-    sys.exit(0)
-try:
-    data = json.loads(raw)
-except Exception as e:
-    sys.stderr.write(f"Carat hook error: invalid JSON payload: {e}\n")
-    sys.exit(3)
-
-cmd = (
-    data.get("tool_input", {}).get("command")
-    or data.get("command")
-    or ""
-)
-if not isinstance(cmd, str) or not cmd.strip():
-    sys.exit(0)
+exec python3 -c '
+import json
+import os
+import re
+import shlex
+import sys
 
 NPM_MUTATING = {
     "install", "i", "in", "ins", "inst", "insta", "instal", "isnt", "isnta", "isntal", "isntall",
     "add", "update", "up", "upgrade", "udpate", "install-test", "it",
 }
 FLAGS_WITH_VAL = {"--prefix", "--registry", "--workspace", "-w", "--tag", "--userconfig", "--cache", "-C"}
+CMD_SEPARATORS = {";", "&&", "||", "|", "&", "\n"}
 
-segments = re.split(r"(?:\s*(?:&&|\|\||;|\|)\s*|\n+)", cmd)
+
+def respond(is_agy, allow, message=""):
+    if is_agy:
+        payload = {"decision": "allow"} if allow else {"decision": "deny", "reason": message}
+        sys.stdout.write(json.dumps(payload) + "\n")
+        sys.exit(0)
+    if allow:
+        sys.exit(0)
+    sys.stderr.write(message + "\n")
+    sys.exit(2)
+
+
+def split_shell_segments(cmd):
+    lexer = shlex.shlex(cmd, posix=True, punctuation_chars=";&|\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    segments = []
+    cur = []
+    for tok in lexer:
+        if tok in CMD_SEPARATORS or (tok and all(c in ";&|\n" for c in tok)):
+            if cur:
+                segments.append(cur)
+                cur = []
+        else:
+            cur.append(tok)
+    if cur:
+        segments.append(cur)
+    return segments
+
+
+raw = sys.stdin.read()
+if not raw.strip():
+    sys.exit(0)
+
+try:
+    data = json.loads(raw)
+except Exception as e:
+    sys.stderr.write(f"BLOCKED by Carat hook: invalid JSON payload: {e}\n")
+    sys.exit(2)
+
+if not isinstance(data, dict):
+    sys.stderr.write("BLOCKED by Carat hook: hook payload must be a JSON object.\n")
+    sys.exit(2)
+
+tool_call = data.get("toolCall")
+is_agy = isinstance(tool_call, dict)
+
+if is_agy:
+    args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
+    cmd = args.get("CommandLine") or args.get("command") or ""
+else:
+    tool_input = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    cmd = tool_input.get("command") or data.get("command") or ""
+
+if not isinstance(cmd, str) or not cmd.strip():
+    respond(is_agy, True)
+
 blocked = []
-for seg in segments:
-    seg = seg.strip()
-    if not seg:
-        continue
-    try:
-        tokens = shlex.split(seg)
-    except ValueError:
+try:
+    segments = split_shell_segments(cmd)
+except ValueError:
+    if re.search(r"(?:^|[^A-Za-z0-9_-])npm(?:\b|$)", cmd):
         blocked.append("unparseable shell command")
-        continue
+    segments = []
 
+for tokens in segments:
     idx = 0
     while idx < len(tokens):
         tok = tokens[idx]
@@ -100,33 +141,19 @@ for seg in segments:
             pkgs.append(tok)
         blocked.append(" ".join(pkgs) if pkgs else f"npm {subcmd}")
 
-for item in blocked:
-    print(item)
+if not blocked:
+    respond(is_agy, True)
+
+lines = [
+    "BLOCKED by Carat pre-install hook: direct '\''npm install'\'' / '\''npm add'\'' / '\''npm update'\'' is disabled to prevent re-resolution TOCTOU and lifecycle-script execution.",
+    "Use Carat as the installer instead:",
+]
+for target in blocked:
+    if target.startswith("npm ") or target == "unparseable shell command":
+        lines.append("  carat check --base <old-lock> --head <new-lock> --json && npm ci --ignore-scripts")
+    else:
+        lines.append(f"  carat add {target} --install --json")
+lines.append("Do NOT bypass this hook or run '\''carat approve'\''. Escalate any stop verdict to the human.")
+
+respond(is_agy, False, "\n".join(lines))
 '
-
-set +e
-MATCHED="$(printf '%s' "$PAYLOAD" | python3 -c "$PY_SCRIPT")"
-PARSE_RC=$?
-set -e
-
-if [[ "$PARSE_RC" -ne 0 ]]; then
-  echo "BLOCKED by Carat hook: failed to parse hook payload (exit ${PARSE_RC})." >&2
-  exit 2
-fi
-
-if [[ -z "$MATCHED" ]]; then
-  exit 0
-fi
-
-echo "BLOCKED by Carat pre-install hook: direct 'npm install' / 'npm add' / 'npm update' is disabled to prevent re-resolution TOCTOU and lifecycle-script execution." >&2
-echo "Use Carat as the installer instead:" >&2
-while IFS= read -r TARGET; do
-  [[ -z "$TARGET" ]] && continue
-  if [[ "$TARGET" == npm\ * || "$TARGET" == "unparseable shell command" ]]; then
-    echo "  carat check --base <old-lock> --head <new-lock> --json && npm ci --ignore-scripts" >&2
-  else
-    echo "  carat add ${TARGET} --install --json" >&2
-  fi
-done <<< "$MATCHED"
-echo "Do NOT bypass this hook or run 'carat approve'. Escalate any stop verdict to the human." >&2
-exit 2

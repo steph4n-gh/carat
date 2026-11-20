@@ -13,7 +13,7 @@ for arg in "$@"; do
     -h|--help)
       echo "Usage: ./scripts/install.sh [--prefix=/path] [--install-skill]"
       echo "  Builds and installs the single 'carat' release binary to \$PREFIX/bin (default: ~/.local/bin)."
-      echo "  --install-skill  Also installs skills/carat/SKILL.md for Claude Code and Codex."
+      echo "  --install-skill  Also installs skills/carat/SKILL.md for Claude Code, Codex, and Antigravity."
       exit 0
       ;;
     *)
@@ -36,7 +36,7 @@ if [[ ":$PATH:" != *":${BIN_DIR}:"* ]]; then
 fi
 
 if [[ "$INSTALL_SKILL" -eq 1 ]]; then
-  for skill_root in "$HOME/.claude/skills" "$HOME/.codex/skills"; do
+  for skill_root in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.gemini/config/skills"; do
     mkdir -p "${skill_root}/carat"
     cp "${REPO_ROOT}/skills/carat/SKILL.md" "${skill_root}/carat/SKILL.md"
     echo "Installed agent skill: ${skill_root}/carat/SKILL.md"

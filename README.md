@@ -47,7 +47,23 @@ STOP  ms 2.1.2 -> 2.1.3
 
 ## Install in 60 seconds
 
-Prerequisites: Rust toolchain (`cargo`), `git`, `curl`, and `npm`.
+Prerequisites: `git`, `curl`, and `npm` (plus `cargo` if building from source).
+
+### Prebuilt binary (Linux & macOS)
+
+Download the tarball for your platform from [GitHub Releases](https://github.com/steph4n-gh/carat/releases) and verify its SHA-256 against `SHA256SUMS.txt`:
+
+```bash
+# Example (macOS Apple Silicon; replace target for x86_64-apple-darwin,
+# x86_64-unknown-linux-gnu, or aarch64-unknown-linux-gnu):
+TARGET="aarch64-apple-darwin"
+curl -fsSLO "https://github.com/steph4n-gh/carat/releases/download/v0.1.0/carat-${TARGET}.tar.gz"
+curl -fsSLO "https://github.com/steph4n-gh/carat/releases/download/v0.1.0/SHA256SUMS.txt"
+grep "carat-${TARGET}.tar.gz" SHA256SUMS.txt | shasum -a 256 -c -
+mkdir -p ~/.local/bin && tar -xzf "carat-${TARGET}.tar.gz" -C ~/.local/bin
+```
+
+### Build from source (includes agent skill installer)
 
 ```bash
 git clone https://github.com/steph4n-gh/carat.git

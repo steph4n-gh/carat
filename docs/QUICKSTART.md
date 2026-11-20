@@ -9,6 +9,20 @@ In this tutorial, you install `carat`, inspect a real npm release transition, ad
 
 ## 1. Install the `carat` binary
 
+### Option A: Prebuilt release binary (no Rust required)
+
+Download the tarball for your platform from [GitHub Releases](https://github.com/steph4n-gh/carat/releases), verify its checksum against `SHA256SUMS.txt`, and unpack `carat` into `~/.local/bin`:
+
+```bash
+TARGET="aarch64-apple-darwin" # or x86_64-apple-darwin, x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+curl -fsSLO "https://github.com/steph4n-gh/carat/releases/download/v0.1.0/carat-${TARGET}.tar.gz"
+curl -fsSLO "https://github.com/steph4n-gh/carat/releases/download/v0.1.0/SHA256SUMS.txt"
+grep "carat-${TARGET}.tar.gz" SHA256SUMS.txt | shasum -a 256 -c -
+mkdir -p ~/.local/bin && tar -xzf "carat-${TARGET}.tar.gz" -C ~/.local/bin
+```
+
+### Option B: Build from source (also installs the coding-agent skill)
+
 Clone the repository and run the installer script:
 
 ```bash

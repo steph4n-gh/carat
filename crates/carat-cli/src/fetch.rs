@@ -36,6 +36,8 @@ impl Fetcher {
             .map_err(|e| format!("failed to create cache dir: {e}"))?;
         fs::create_dir_all(cache_dir.join("git"))
             .map_err(|e| format!("failed to create git cache dir: {e}"))?;
+        let cache_dir = fs::canonicalize(&cache_dir)
+            .map_err(|e| format!("failed to canonicalize cache dir: {e}"))?;
         Ok(Self { cache_dir })
     }
 
@@ -1110,10 +1112,11 @@ fn hardened_git_cmd(cwd: Option<&Path>) -> Command {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let mut cmd = hardened_git_cmd(Some(cwd));
-    // Explicitly pass GIT_DIR for bare cache repos (except during `init`) so `safe.bareRepository=explicit` works cleanly.
+    let abs_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut cmd = hardened_git_cmd(Some(&abs_cwd));
+    // Explicitly pass absolute GIT_DIR for bare cache repos (except during `init`) so `safe.bareRepository=explicit` works cleanly.
     if args.first().copied() != Some("init") {
-        cmd.env("GIT_DIR", cwd);
+        cmd.env("GIT_DIR", &abs_cwd);
     }
     let out = cmd
         .args(args)
@@ -1128,10 +1131,11 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 
 fn git_ls_remote(neutral_dir: &Path, repo_url: &str) -> Result<BTreeMap<String, String>, String> {
     validate_public_https_git_url(repo_url)?;
-    // Run inside neutral cache directory (never process CWD) with GIT_CEILING_DIRECTORIES so an
+    let abs_neutral = fs::canonicalize(neutral_dir).unwrap_or_else(|_| neutral_dir.to_path_buf());
+    // Run inside neutral cache directory (never process CWD) with absolute GIT_CEILING_DIRECTORIES so an
     // untrusted checkout's `.git/config` cannot inject `url.*.insteadOf` or `credential.helper`.
-    let out = hardened_git_cmd(Some(neutral_dir))
-        .env("GIT_CEILING_DIRECTORIES", neutral_dir)
+    let out = hardened_git_cmd(Some(&abs_neutral))
+        .env("GIT_CEILING_DIRECTORIES", &abs_neutral)
         .args(["ls-remote", "--tags", "--heads", "--", repo_url])
         .output()
         .map_err(|e| format!("failed to spawn git ls-remote: {e}"))?;
@@ -1207,8 +1211,9 @@ fn read_git_blobs_batch(
     repo_dir: &Path,
     sha1s: &[String],
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
-    let mut child = hardened_git_cmd(Some(repo_dir))
-        .env("GIT_DIR", repo_dir)
+    let abs_repo = fs::canonicalize(repo_dir).unwrap_or_else(|_| repo_dir.to_path_buf());
+    let mut child = hardened_git_cmd(Some(&abs_repo))
+        .env("GIT_DIR", &abs_repo)
         .args(["cat-file", "--batch"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1284,4 +1289,29 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_git_handles_relative_bare_repo_path() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let unique = format!(
+            "target/test-rel-bare-git-{}",
+            std::process::id()
+        );
+        let rel = PathBuf::from(&unique);
+        let abs = cwd.join(&rel);
+        let _ = fs::remove_dir_all(&abs);
+        fs::create_dir_all(&abs).expect("mkdir");
+
+        run_git(&rel, &["init", "--bare", "--quiet"]).expect("git init --bare");
+        let out = run_git(&rel, &["rev-parse", "--is-bare-repository"])
+            .expect("rev-parse must succeed on relative bare path");
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "true");
+
+        let _ = fs::remove_dir_all(&abs);
+    }
 }

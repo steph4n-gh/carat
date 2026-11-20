@@ -6,7 +6,7 @@ This repository builds **Assay**, a local dependency balance-sheet tool. Follow 
 
 ## Non-Negotiable Rules for Agents Using Assay
 
-1. **Check before installing.** Before running `npm install <pkg>` or adding/updating any npm dependency, run `assay add <pkg> --json` (or call the `assay_add` MCP tool).
+1. **Use Assay as the installer.** Instead of running `npm install <pkg>` directly (which re-resolves from the registry), run `assay add <pkg> --install --json` (or call MCP `assay_add` with `install: true`). Assay resolves once in a temp directory, verifies every changed byte, and—only if every transition passes—writes that exact checked lockfile and runs `npm ci --ignore-scripts`.
 2. **Never approve stops.** You MUST NOT run `assay approve`, edit `.assay/approvals/`, weaken `assay.toml`, or bypass a stop verdict (`exit 1`). Only a human may approve a stop.
 3. **Never claim a package is "safe."** Report Assay's exact verdict (`explained`, `read`, or `stop`) and facts. An `explained` verdict means every changed byte matched prior bytes or public Git source with no breaks or new reach—not that the package is guaranteed benign.
 4. **Never inspect untrusted archives outside Assay.** Do not extract or execute downloaded npm tarballs to inspect them manually; Assay inspects tarballs strictly in memory.

@@ -53,12 +53,10 @@ pub fn scan_artifact_reach(loaded: &LoadedArchive, manifest: &ManifestFacts) -> 
         let is_manifest_entry =
             manifest.bin_paths.contains(rel) || manifest.entry_paths.contains(rel);
 
-        // Skip non-executable declarations, source maps, docs, and raw binary blobs.
-        if matches!(
-            role,
-            FileRole::Declaration | FileRole::SourceMap | FileRole::Doc
-        ) && !is_manifest_entry
-        {
+        // Skip non-executable declarations and source maps unless referenced as a manifest entrypoint.
+        // Note: `.md` / doc files are STILL scanned if they contain code or are referenced as entrypoints
+        // (Node's `require('./notes.md')` executes arbitrary JS).
+        if matches!(role, FileRole::Declaration | FileRole::SourceMap) && !is_manifest_entry {
             continue;
         }
         if role == FileRole::Binary {
@@ -70,10 +68,19 @@ pub fn scan_artifact_reach(loaded: &LoadedArchive, manifest: &ManifestFacts) -> 
             continue;
         }
 
-        // Only scan code, manifest, json, shebangs, or declared bin/entry files.
+        // Only scan code, manifest, json, shebangs, docs with code signals, or declared bin/entry files.
         let lower = rel.to_ascii_lowercase();
         let is_json = lower.ends_with(".json");
-        if role != FileRole::Code && role != FileRole::Manifest && !is_json && !is_manifest_entry {
+        let is_doc_with_js = role == FileRole::Doc
+            && (bytes.windows(8).any(|w| w == b"require(")
+                || bytes.windows(13).any(|w| w == b"child_process")
+                || bytes.windows(11).any(|w| w == b"process.env"));
+        if role != FileRole::Code
+            && role != FileRole::Manifest
+            && !is_json
+            && !is_manifest_entry
+            && !is_doc_with_js
+        {
             continue;
         }
 
@@ -134,10 +141,6 @@ pub fn compute_reach_delta(
         .map(|r| &r.hostnames)
         .cloned()
         .unwrap_or_default();
-    let ref_minified = ref_reach_full
-        .map(|r| &r.minified_files)
-        .cloned()
-        .unwrap_or_default();
 
     let mut new_reach = BTreeSet::new();
     let mut new_reach_in_unexplained = BTreeSet::new();
@@ -155,21 +158,6 @@ pub fn compute_reach_delta(
                         new_reach_in_unexplained.insert(tok);
                     }
                     new_reach_files.entry(tok).or_default().push(path.clone());
-                }
-            }
-        }
-
-        // Check `minified_new`: file is minified at a path that existed in reference and was NOT minified.
-        if new_reach_full.minified_files.contains(path)
-            && ref_reach_full.is_some()
-            && !ref_minified.contains(path)
-        {
-            if let Some(rr) = ref_reach_full {
-                // Only count as minified_new if the same path existed in ref (or any non-minified file became minified).
-                // If the whole reference had no minified files or this path wasn't minified before:
-                if rr.per_file_tokens.contains_key(path) || !rr.minified_files.contains(path) {
-                    // Check carefully: only fire minified_new if the path existed in reference without minification.
-                    // Handled more cleanly via caller passing reference path set if needed; here we check ref_minified.
                 }
             }
         }
@@ -331,7 +319,7 @@ fn scan_text_signals(
         // Dynamic code execution (high)
         if contains_word_call(text, "eval")
             || text.contains("new Function(")
-            || text.contains("Function(") && text.contains("return ")
+            || (contains_word_call(text, "Function") && text.contains("return "))
             || has_any_module_or_call(text, &["vm"], &["WebAssembly.compile", "WebAssembly.instantiate"])
             || has_dynamic_require_or_import(text)
         {
@@ -595,5 +583,14 @@ mod tests {
         assert!(!has_dynamic_require_or_import("const x = require('./foo');"));
         assert!(has_dynamic_require_or_import("const x = require(modName);"));
         assert!(has_dynamic_require_or_import("const x = import(`./plugins/${name}`);"));
+    }
+
+    #[test]
+    fn is_function_helper_does_not_trigger_dyn_code() {
+        let mut tokens = BTreeSet::new();
+        let mut hosts = BTreeSet::new();
+        let benign = "function isFunction(v) { return typeof v === 'function'; }\n";
+        scan_text_signals(benign, true, &mut tokens, &mut hosts);
+        assert!(!tokens.contains(&ReachToken::DynCode));
     }
 }

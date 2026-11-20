@@ -1,5 +1,5 @@
 use crate::canonical::{canonical_id, to_canonical_json};
-use crate::model::{Anchor, ArtifactProfile, Decision, StopRule, TransitionLedger};
+use crate::model::{Anchor, ArtifactProfile, Decision, TransitionLedger};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -11,7 +11,9 @@ pub struct ApprovalRecord {
     pub schema: u32,
     pub subject: String,
     pub ledger_id: String,
-    pub approved_stop_rules: BTreeSet<StopRule>,
+    /// Exact concrete stop fact keys approved by the human (e.g. `break:provenance_lost`, `advisory:MAL-...`).
+    /// Any new stop fact outside this set invalidates the approval under S10.
+    pub approved_facts: BTreeSet<String>,
     pub approver: String,
     pub approved_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,7 +46,7 @@ pub struct InputBundle {
     pub new_source_tree: BTreeMap<String, String>,
     pub new_source_blobs_b64: BTreeMap<String, String>,
     pub registry_snapshot_file: Option<String>,
-    pub registry_snapshot_sha256: Option<String>,
+    pub history_slice_sha256: Option<String>,
     pub as_of: String,
     pub expected_ledger_id: String,
 }
@@ -97,11 +99,24 @@ impl RecordStore {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
     }
 
-    pub fn find_latest_ledger_for_subject(&self, subject: &str) -> Option<(String, TransitionLedger)> {
+    /// Finds the unique subject matching `subject_prefix` (requiring >= 8 hex chars and rejecting ambiguity).
+    pub fn find_unique_ledger_for_subject(
+        &self,
+        subject_prefix: &str,
+    ) -> Result<(String, TransitionLedger), String> {
+        let q = subject_prefix.trim().to_ascii_lowercase();
+        if q.len() < 8 || !q.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "subject '{subject_prefix}' must be at least 8 hex characters"
+            ));
+        }
+
         let mut dirs = vec![self.root.join("ledgers")];
         for ro in &self.readonly_stores {
             dirs.push(ro.join("ledgers"));
         }
+
+        let mut matches_by_subject: BTreeMap<String, (String, TransitionLedger)> = BTreeMap::new();
         for dir in dirs {
             let Ok(entries) = fs::read_dir(dir) else {
                 continue;
@@ -113,19 +128,31 @@ impl RecordStore {
                 }
                 if let Ok(bytes) = fs::read(&p) {
                     if let Ok(ledger) = serde_json::from_slice::<TransitionLedger>(&bytes) {
-                        if ledger.subject == subject || ledger.subject.starts_with(subject) {
+                        if ledger.subject == q || ledger.subject.starts_with(&q) {
                             let id = p
                                 .file_stem()
                                 .and_then(|s| s.to_str())
                                 .unwrap_or("")
                                 .to_string();
-                            return Some((id, ledger));
+                            matches_by_subject
+                                .entry(ledger.subject.clone())
+                                .or_insert((id, ledger));
                         }
                     }
                 }
             }
         }
-        None
+
+        match matches_by_subject.len() {
+            0 => Err(format!(
+                "no recorded ledger found in {} matching subject '{subject_prefix}'",
+                self.root.display()
+            )),
+            1 => Ok(matches_by_subject.into_values().next().unwrap()),
+            n => Err(format!(
+                "ambiguous subject prefix '{subject_prefix}' matched {n} distinct subjects; pass a longer prefix"
+            )),
+        }
     }
 
     pub fn save_decision(&self, decision: &Decision) -> Result<(), String> {
@@ -208,14 +235,10 @@ impl RecordStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::StopRule;
 
     #[test]
     fn saves_and_finds_approval_across_readonly_stores() {
-        let tmp = std::env::temp_dir().join(format!(
-            "assay-store-test-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("assay-store-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         let shared = tmp.join("shared");
         let local = tmp.join("local");
@@ -224,9 +247,9 @@ mod tests {
         let rec = ApprovalRecord {
             kind: "approval".into(),
             schema: 1,
-            subject: "abcdef123456".into(),
+            subject: "abcdef1234567890".into(),
             ledger_id: "112233".into(),
-            approved_stop_rules: BTreeSet::from([StopRule::S4, StopRule::S8]),
+            approved_facts: BTreeSet::from(["break:provenance_lost".into()]),
             approver: "alice".into(),
             approved_at: "2026-11-19T23:00:00Z".into(),
             note: Some("reviewed".into()),
@@ -234,7 +257,7 @@ mod tests {
         shared_store.save_approval(&rec).unwrap();
 
         let local_store = RecordStore::open(local, vec![shared]).unwrap();
-        let loaded = local_store.find_approval("abcdef123456").unwrap();
+        let loaded = local_store.find_approval("abcdef1234567890").unwrap();
         assert_eq!(loaded, rec);
         let _ = fs::remove_dir_all(&tmp);
     }

@@ -57,6 +57,7 @@ pub fn inspect_tgz(
     let mut next_gnu_longname: Option<String> = None;
 
     let mut header = [0u8; 512];
+    let mut consecutive_zero_blocks = 0u32;
     loop {
         match read_exact_or_eof(&mut decoder, &mut header) {
             Ok(false) => break,
@@ -67,9 +68,38 @@ pub fn inspect_tgz(
             }
         }
 
-        // Two consecutive zero blocks mark end-of-archive.
+        // Strict tar EOF handling (prevents tar parser differential with npm's node-tar):
+        // - Standard EOF is two consecutive 512-byte zero blocks followed ONLY by zero padding.
+        // - If a single zero block is followed by non-zero data, flag ArchiveCorrupt and keep scanning!
+        // - If two zero blocks are followed by any non-zero trailing data, flag ArchiveCorrupt!
         if header.iter().all(|&b| b == 0) {
-            break;
+            consecutive_zero_blocks += 1;
+            if consecutive_zero_blocks >= 2 {
+                // Verify only zero bytes remain to EOF.
+                let mut trailing = [0u8; 4096];
+                loop {
+                    match decoder.read(&mut trailing) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if trailing[..n].iter().any(|&b| b != 0) {
+                                facts.insert(ArchiveFact::ArchiveCorrupt);
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            facts.insert(ArchiveFact::ArchiveCorrupt);
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+            continue;
+        } else if consecutive_zero_blocks == 1 {
+            // Non-zero header immediately after a lone zero block: npm's tar keeps parsing here,
+            // so record ArchiveCorrupt AND continue parsing so nothing hides behind a lone zero block.
+            facts.insert(ArchiveFact::ArchiveCorrupt);
+            consecutive_zero_blocks = 0;
         }
 
         if !verify_tar_checksum(&header) {
@@ -636,5 +666,37 @@ mod tests {
         assert!(loaded_h.inventory.facts.contains(&ArchiveFact::ArchivePathEscape));
         assert!(loaded_h.inventory.facts.contains(&ArchiveFact::ArchiveDuplicatePath));
         assert!(loaded_h.inventory.facts.contains(&ArchiveFact::ArchiveLinkEntry));
+
+        // Tar parser differential: payload hidden after a lone zero block must trigger ArchiveCorrupt AND still be inventoried!
+        let mut tar = Vec::new();
+        let write_entry = |tar: &mut Vec<u8>, name: &str, data: &[u8]| {
+            let mut hdr = [0u8; 512];
+            hdr[..name.len()].copy_from_slice(name.as_bytes());
+            hdr[100..108].copy_from_slice(b"0000644\0");
+            hdr[108..116].copy_from_slice(b"0000000\0");
+            hdr[116..124].copy_from_slice(b"0000000\0");
+            hdr[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+            hdr[136..148].copy_from_slice(b"00000000000\0");
+            hdr[148..156].copy_from_slice(b"        ");
+            hdr[156] = b'0';
+            hdr[257..263].copy_from_slice(b"ustar\0");
+            hdr[263..265].copy_from_slice(b"00");
+            let csum: u32 = hdr.iter().map(|&b| b as u32).sum();
+            hdr[148..156].copy_from_slice(format!("{csum:06o}\0 ").as_bytes());
+            tar.extend_from_slice(&hdr);
+            tar.extend_from_slice(data);
+            let pad = (512 - (data.len() % 512)) % 512;
+            tar.extend(std::iter::repeat_n(0u8, pad));
+        };
+        write_entry(&mut tar, "package/index.js", b"export const ok = 1;\n");
+        tar.extend(std::iter::repeat_n(0u8, 512)); // lone zero block!
+        write_entry(&mut tar, "package/hidden.js", b"require('child_process');\n");
+        tar.extend(std::iter::repeat_n(0u8, 1024));
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&tar).unwrap();
+        let diff_tgz = enc.finish().unwrap();
+        let loaded_d = inspect_tgz(&diff_tgz, None, ArchiveLimits::default()).unwrap();
+        assert!(loaded_d.inventory.facts.contains(&ArchiveFact::ArchiveCorrupt));
+        assert!(loaded_d.contents.contains_key("package/hidden.js"));
     }
 }

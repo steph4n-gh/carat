@@ -56,11 +56,13 @@ pub struct TransitionInput<'a> {
     pub new_published_at: Option<String>,
     pub lock_alarms: BTreeSet<LockAlarm>,
     pub history_ctx: HistoryContext,
-    pub registry_snapshot_sha256: Option<String>,
+    pub history_slice_sha256: Option<String>,
 }
 
-/// Builds a timeless deterministic `TransitionLedger` (no `now` clock, no relative ages).
-pub fn build_transition_ledger(input: TransitionInput<'_>) -> Result<(TransitionLedger, String), String> {
+/// Builds a timeless deterministic `TransitionLedger` (no wall-clock timestamps, no full mutable packument hash).
+pub fn build_transition_ledger(
+    input: TransitionInput<'_>,
+) -> Result<(TransitionLedger, String), String> {
     let new_profile_id = canonical_id(input.new_profile)?;
     let ref_endpoint = match (input.reference_profile, input.reference_archive) {
         (Some(rp), Some(_)) => Some(LedgerEndpoint {
@@ -150,7 +152,7 @@ pub fn build_transition_ledger(input: TransitionInput<'_>) -> Result<(Transition
 
     let ledger = TransitionLedger {
         kind: "ledger".to_string(),
-        schema: 1,
+        schema: 2,
         subject,
         ecosystem: input.ecosystem.to_string(),
         name: input.name.to_string(),
@@ -173,11 +175,15 @@ pub fn build_transition_ledger(input: TransitionInput<'_>) -> Result<(Transition
         breaks: history.breaks,
         flags: history.flags,
         break_notes: history.notes,
+        advisory_ids: input.history_ctx.known_malicious_ids,
+        osv_unavailable: input.history_ctx.osv_unavailable,
         new_reach: reach_delta.new_reach,
         new_reach_in_unexplained: reach_delta.new_reach_in_unexplained,
         new_reach_files: reach_delta.new_reach_files,
         new_hostnames: reach_delta.new_hostnames,
-        registry_snapshot_sha256: input.registry_snapshot_sha256,
+        prior_release_count: input.history_ctx.total_prior_releases,
+        package_first_published_at: input.history_ctx.package_first_published_at,
+        history_slice_sha256: input.history_slice_sha256,
         tool_version: TOOL_VERSION.to_string(),
     };
 
@@ -186,6 +192,7 @@ pub fn build_transition_ledger(input: TransitionInput<'_>) -> Result<(Transition
 }
 
 /// Evaluates policy stop rules `S1`–`S10` on a timeless `TransitionLedger` at explicit `as_of`.
+/// Produces concrete `stop_facts` (for granular S10 approval staleness) and plain-English `stop_reasons`.
 pub fn evaluate_decision(
     ledger: &TransitionLedger,
     ledger_id: &str,
@@ -193,13 +200,25 @@ pub fn evaluate_decision(
     as_of: &str,
     is_new_direct_dependency: bool,
     reading_outcome: ReadingOutcome,
-    prior_approved_stop_rules: Option<&BTreeSet<StopRule>>,
+    prior_approved_facts: Option<&BTreeSet<String>>,
 ) -> Decision {
+    let as_of_unix = parse_rfc3339_unix(as_of);
     let published_age_hours = match (
         ledger.new.published_at.as_deref().and_then(parse_rfc3339_unix),
-        parse_rfc3339_unix(as_of),
+        as_of_unix,
     ) {
         (Some(pub_u), Some(now_u)) => Some((now_u - pub_u) / 3600),
+        _ => None,
+    };
+
+    let package_age_days = match (
+        ledger
+            .package_first_published_at
+            .as_deref()
+            .and_then(parse_rfc3339_unix),
+        as_of_unix,
+    ) {
+        (Some(first_u), Some(now_u)) => Some((now_u - first_u) / 86_400),
         _ => None,
     };
 
@@ -214,96 +233,158 @@ pub fn evaluate_decision(
     };
 
     let mut stop_rules = BTreeSet::new();
+    let mut stop_facts = BTreeSet::new();
     let mut stop_reasons = Vec::new();
 
     // S1: Missing SHA-512 integrity
     if ledger.lock_alarms.contains(&LockAlarm::IntegrityMissing) {
         stop_rules.insert(StopRule::S1);
-        stop_reasons.push("S1: new artifact has no SHA-512 integrity".to_string());
+        stop_facts.insert(LockAlarm::IntegrityMissing.fact_key().to_string());
+        stop_reasons.push(LockAlarm::IntegrityMissing.human_label().to_string());
     }
 
     // S2: Other lock alarms
-    let other_alarms: Vec<&LockAlarm> = ledger
+    for alarm in ledger
         .lock_alarms
         .iter()
         .filter(|&&a| a != LockAlarm::IntegrityMissing)
-        .collect();
-    if !other_alarms.is_empty() {
+    {
         stop_rules.insert(StopRule::S2);
-        stop_reasons.push(format!("S2: lock alarms: {other_alarms:?}"));
+        stop_facts.insert(alarm.fact_key().to_string());
+        stop_reasons.push(alarm.human_label().to_string());
     }
 
-    // S3: Archive facts
-    if !ledger.archive_facts.is_empty() {
+    // S3: Archive anomalies
+    for fact in &ledger.archive_facts {
         stop_rules.insert(StopRule::S3);
-        stop_reasons.push(format!("S3: archive anomalies: {:?}", ledger.archive_facts));
+        stop_facts.insert(fact.fact_key().to_string());
+        stop_reasons.push(fact.human_label().to_string());
     }
 
-    // S4: Stop-severity breaks
-    if !ledger.breaks.is_empty() {
+    // S4: Stop-severity breaks (each recorded as a distinct concrete fact, including specific OSV advisory IDs!)
+    for b in &ledger.breaks {
         stop_rules.insert(StopRule::S4);
-        for b in &ledger.breaks {
-            let note = ledger
-                .break_notes
-                .get(b)
-                .map(|s| format!(" ({s})"))
-                .unwrap_or_default();
-            stop_reasons.push(format!("S4: break {b:?}{note}"));
+        if *b == BreakKind::KnownMalicious && !ledger.advisory_ids.is_empty() {
+            for adv in &ledger.advisory_ids {
+                stop_facts.insert(format!("advisory:{adv}"));
+            }
+        } else {
+            stop_facts.insert(b.fact_key().to_string());
+        }
+        let note = ledger
+            .break_notes
+            .get(b)
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        stop_reasons.push(format!("{}{note}", b.human_label()));
+    }
+
+    // S5: New direct dependency policy (default: ThinHistory -> stops only on young/sparse packages!)
+    if is_new_direct_dependency {
+        match policy.new_direct_dependency {
+            NewDirectPolicy::Confirm => {
+                stop_rules.insert(StopRule::S5);
+                stop_facts.insert("direct:confirm".to_string());
+                stop_reasons.push("new direct dependency requires human confirmation".to_string());
+            }
+            NewDirectPolicy::ThinHistory => {
+                let is_young = package_age_days.map(|d| d < 30).unwrap_or(true);
+                let few_releases = ledger.prior_release_count < 3;
+                if is_young || few_releases {
+                    stop_rules.insert(StopRule::S5);
+                    stop_facts.insert("direct:thin_history".to_string());
+                    let age_note = package_age_days
+                        .map(|d| format!("{d}d old"))
+                        .unwrap_or_else(|| "unknown age".to_string());
+                    stop_reasons.push(format!(
+                        "new direct dependency has thin publishing history ({age_note}, {} prior release(s))",
+                        ledger.prior_release_count
+                    ));
+                }
+            }
+            NewDirectPolicy::Check => {}
         }
     }
 
-    // S5: New direct dependency
-    if is_new_direct_dependency && policy.new_direct_dependency == NewDirectPolicy::Confirm {
-        stop_rules.insert(StopRule::S5);
-        stop_reasons.push("S5: new direct dependency requires human confirmation".to_string());
-    }
-
-    // S6: Unexplained bytes and no anchor (unless settled)
-    let has_unexplained = ledger
-        .totals
-        .get(&OriginClass::Unexplained)
-        .map(|t| t.files > 0)
-        .unwrap_or(false);
-    if has_unexplained && !ledger.anchor.found && age_band != ReleaseAgeBand::Settled {
+    // S6: Unexplained executable/manifest bytes with no anchor (unless settled)
+    let has_unexplained_code = ledger.unexplained_code_bytes > 0;
+    if has_unexplained_code && !ledger.anchor.found && age_band != ReleaseAgeBand::Settled {
         stop_rules.insert(StopRule::S6);
-        stop_reasons.push("S6: unexplained bytes with no source anchor".to_string());
+        stop_facts.insert("unanchored:unexplained_code".to_string());
+        if let Some(ref err) = ledger.anchor.lookup_error {
+            stop_reasons.push(format!(
+                "unexplained code bytes and source repository lookup failed ({err})"
+            ));
+        } else {
+            stop_reasons.push("unexplained code bytes with no verified source anchor".to_string());
+        }
     }
 
-    // S7: New high reach token, or any new reach token inside unexplained bytes
-    let new_high_reach: Vec<_> = ledger.new_reach.iter().filter(|t| t.is_high()).collect();
-    if !new_high_reach.is_empty() || !ledger.new_reach_in_unexplained.is_empty() {
+    // S7: New high-risk reach token, or any new reach token inside unexplained bytes
+    let new_high_reach: Vec<_> = ledger.new_reach.iter().filter(|t| t.is_high()).copied().collect();
+    for tok in &new_high_reach {
         stop_rules.insert(StopRule::S7);
-        stop_reasons.push(format!(
-            "S7: new reach high={new_high_reach:?} in_unexplained={:?}",
-            ledger.new_reach_in_unexplained
-        ));
+        stop_facts.insert(format!("reach_high:{}", tok.key()));
+        stop_reasons.push(format!("new high-risk capability: {}", tok.human_label()));
+    }
+    for tok in &ledger.new_reach_in_unexplained {
+        if !tok.is_high() {
+            stop_rules.insert(StopRule::S7);
+            stop_facts.insert(format!("reach_unexplained:{}", tok.key()));
+            stop_reasons.push(format!(
+                "new capability inside unexplained bytes: {}",
+                tok.human_label()
+            ));
+        }
     }
 
-    let reading_required = has_unexplained || !ledger.flags.is_empty() || !ledger.new_reach.is_empty();
+    // Reading is required ONLY when unexplained executable/manifest bytes, flags, or new reach exist.
+    // Pure non-executable doc/declaration/sourcemap differences never cause a fake S8 stop!
+    let reading_required =
+        has_unexplained_code || !ledger.flags.is_empty() || !ledger.new_reach.is_empty();
 
     // S8: Reading required and did not pass
     if reading_required && reading_outcome != ReadingOutcome::Passed {
         stop_rules.insert(StopRule::S8);
-        stop_reasons.push(format!(
-            "S8: reading required (outcome={reading_outcome:?})"
-        ));
+        stop_facts.insert(format!("reading:{reading_outcome:?}").to_ascii_lowercase());
+        let msg = match reading_outcome {
+            ReadingOutcome::NotRun => {
+                "unexplained code or flags remain (inspect the inline diff below, or re-run with --read)"
+            }
+            ReadingOutcome::Concern => "reader flagged suspicious or concerning code",
+            ReadingOutcome::Invalid => "reader output failed validation (ungrounded citation or schema error)",
+            ReadingOutcome::Unread => "unexplained diff exceeded reader hard cap or contains binary data",
+            ReadingOutcome::Refused => "reader model refused to review content",
+            ReadingOutcome::Unavailable => "reader unavailable (check ANTHROPIC_API_KEY or reader.command)",
+            ReadingOutcome::NotRequired | ReadingOutcome::Passed => "reading did not pass",
+        };
+        stop_reasons.push(msg.to_string());
     }
 
-    // S9: Fresh release (< min_age) and would otherwise be `read`
+    // S9: Fresh release (< min_age) and not deterministically explained
     if age_band == ReleaseAgeBand::Fresh && reading_required {
         stop_rules.insert(StopRule::S9);
+        stop_facts.insert("age:fresh_unexplained".to_string());
         stop_reasons.push(format!(
-            "S9: release is fresh ({}h < {}h) and not fully explained",
-            published_age_hours.unwrap_or(0),
-            policy.min_age_hours
+            "release is less than {}h old ({}h) and not fully explained by source",
+            policy.min_age_hours,
+            published_age_hours.unwrap_or(0)
         ));
     }
 
-    // S10: Stale approval (new stop reasons appeared since approval)
-    if let Some(approved_rules) = prior_approved_stop_rules {
-        if !stop_rules.is_subset(approved_rules) {
+    // S10: Granular staleness check — ANY concrete stop fact absent from `prior_approved_facts` invalidates the approval!
+    if let Some(approved) = prior_approved_facts {
+        let new_facts: Vec<&String> = stop_facts.difference(approved).collect();
+        if !new_facts.is_empty() {
             stop_rules.insert(StopRule::S10);
-            stop_reasons.push("S10: new stop reasons appeared since prior approval".to_string());
+            let joined = new_facts
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            stop_reasons.push(format!(
+                "prior approval is stale: new stop facts appeared ({joined})"
+            ));
         }
     }
 
@@ -319,7 +400,7 @@ pub fn evaluate_decision(
 
     Decision {
         kind: "decision".to_string(),
-        schema: 1,
+        schema: 2,
         ledger_id: ledger_id.to_string(),
         subject: ledger.subject.clone(),
         as_of: as_of.to_string(),
@@ -333,6 +414,7 @@ pub fn evaluate_decision(
             ReadingOutcome::NotRequired
         },
         stop_rules,
+        stop_facts,
         stop_reasons,
         verdict,
     }
@@ -392,6 +474,7 @@ mod tests {
             workflow_path: None,
             workflow_ref: None,
             reachable_from_branch: Some(true),
+            lookup_error: None,
         }
     }
 
@@ -408,6 +491,7 @@ mod tests {
             workflow_path: None,
             workflow_ref: None,
             reachable_from_branch: None,
+            lookup_error: None,
         }
     }
 
@@ -441,6 +525,8 @@ mod tests {
             lock_alarms: BTreeSet::new(),
             history_ctx: HistoryContext {
                 prior_releases: vec![],
+                total_prior_releases: 10,
+                package_first_published_at: Some("2022-01-01T00:00:00Z".into()),
                 new_release: ReleaseMetaSummary {
                     version: "1.0.1".into(),
                     published_at: Some("2026-11-19T20:00:00Z".into()),
@@ -449,12 +535,11 @@ mod tests {
                 reference_had_anchor: Some(true),
                 ..Default::default()
             },
-            registry_snapshot_sha256: Some("deadbeef".into()),
+            history_slice_sha256: Some("deadbeef".into()),
         })
         .unwrap();
 
         let policy = PolicyConfig::default();
-        // 3 hours later: fresh -> S9 stops even if reading passed
         let fresh = evaluate_decision(
             &ledger,
             &ledger_id,
@@ -467,7 +552,6 @@ mod tests {
         assert_eq!(fresh.verdict, Verdict::Stop);
         assert!(fresh.stop_rules.contains(&StopRule::S9));
 
-        // 30 hours later: recent -> same ledger_id passes as Read when reading passed
         let recent = evaluate_decision(
             &ledger,
             &ledger_id,
@@ -480,6 +564,76 @@ mod tests {
         assert_eq!(recent.verdict, Verdict::Read);
         assert!(recent.stop_rules.is_empty());
         assert_eq!(fresh.ledger_id, recent.ledger_id);
+    }
+
+    #[test]
+    fn granular_s10_invalidates_s4_approval_when_new_malicious_advisory_arrives() {
+        let tgz = make_tgz(&[
+            ("package/package.json", br#"{"name":"demo","version":"1.0.1"}"#),
+            ("package/index.js", b"export const ok = true;\n"),
+        ]);
+        let arch = inspect_tgz(&tgz, None, ArchiveLimits::default()).unwrap();
+        let mut tree = BTreeMap::new();
+        let mut blobs = BTreeMap::new();
+        for (p, b) in &arch.contents {
+            let rel = p.strip_prefix("package/").unwrap().to_string();
+            let sha1 = crate::digest::git_blob_sha1_hex(b);
+            tree.insert(rel, sha1.clone());
+            blobs.insert(sha1, b.clone());
+        }
+        let src = SourceSnapshot {
+            tree_blob_sha1: tree,
+            blobs_by_sha1: blobs,
+            package_dir: None,
+        };
+        let prof = build_artifact_profile("npm", "demo", "1.0.1", &arch, anchored("bbb"), Some(&src));
+
+        // Later, a MAL advisory arrives on top of provenance_lost (both are S4!)
+        let (ledger, ledger_id) = build_transition_ledger(TransitionInput {
+            ecosystem: "npm",
+            name: "demo",
+            reference_archive: None,
+            reference_profile: None,
+            reference_standing: ReferenceStanding::None,
+            reference_published_at: None,
+            new_archive: &arch,
+            new_profile: &prof,
+            new_source: Some(&src),
+            new_published_at: Some("2026-10-01T00:00:00Z".into()),
+            lock_alarms: BTreeSet::new(),
+            history_ctx: HistoryContext {
+                prior_releases: vec![ReleaseMetaSummary {
+                    version: "1.0.0".into(),
+                    has_provenance: true,
+                    ..Default::default()
+                }],
+                total_prior_releases: 5,
+                package_first_published_at: Some("2024-01-01T00:00:00Z".into()),
+                new_release: ReleaseMetaSummary {
+                    version: "1.0.1".into(),
+                    has_provenance: false,
+                    ..Default::default()
+                },
+                known_malicious_ids: vec!["MAL-2026-9999".into()],
+                ..Default::default()
+            },
+            history_slice_sha256: Some("abc".into()),
+        })
+        .unwrap();
+
+        // Human previously approved ONLY `break:provenance_lost` (which was S4).
+        let approved = BTreeSet::from(["break:provenance_lost".to_string()]);
+        let dec = evaluate_decision(
+            &ledger,
+            &ledger_id,
+            &PolicyConfig::default(),
+            "2026-11-19T23:00:00Z",
+            false,
+            ReadingOutcome::NotRun,
+            Some(&approved),
+        );
+        assert!(dec.stop_facts.contains("advisory:MAL-2026-9999"));
+        assert!(dec.stop_rules.contains(&StopRule::S10));
     }
 
     #[test]
@@ -500,7 +654,6 @@ mod tests {
         let ref_arch = inspect_tgz(&ref_tgz, None, ArchiveLimits::default()).unwrap();
         let new_arch = inspect_tgz(&new_tgz, None, ArchiveLimits::default()).unwrap();
 
-        // Reference matched source completely
         let mut tree = BTreeMap::new();
         let mut blobs = BTreeMap::new();
         let pkg_sha1 = crate::digest::git_blob_sha1_hex(ref_pkg);
@@ -538,6 +691,8 @@ mod tests {
                     repository_url: Some("https://github.com/org/pkg".into()),
                     ..Default::default()
                 }],
+                total_prior_releases: 1,
+                package_first_published_at: Some("2026-10-01T00:00:00Z".into()),
                 new_release: ReleaseMetaSummary {
                     version: "1.0.1".into(),
                     has_provenance: false,
@@ -546,7 +701,7 @@ mod tests {
                 reference_had_anchor: Some(true),
                 ..Default::default()
             },
-            registry_snapshot_sha256: Some("abc".into()),
+            history_slice_sha256: Some("abc".into()),
         })
         .unwrap();
 

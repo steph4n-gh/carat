@@ -33,6 +33,30 @@ pub enum ArchiveFact {
     ArchiveCorrupt,
 }
 
+impl ArchiveFact {
+    pub fn fact_key(self) -> &'static str {
+        match self {
+            Self::ArchiveDuplicatePath => "archive:duplicate_path",
+            Self::ArchiveLinkEntry => "archive:link_entry",
+            Self::ArchiveSpecialEntry => "archive:special_entry",
+            Self::ArchivePathEscape => "archive:path_escape",
+            Self::ArchiveOverLimit => "archive:over_limit",
+            Self::ArchiveCorrupt => "archive:corrupt",
+        }
+    }
+
+    pub fn human_label(self) -> &'static str {
+        match self {
+            Self::ArchiveDuplicatePath => "duplicate or case-colliding archive paths",
+            Self::ArchiveLinkEntry => "symlink or hardlink entry in archive",
+            Self::ArchiveSpecialEntry => "special device/FIFO entry in archive",
+            Self::ArchivePathEscape => "path traversal or absolute path in archive",
+            Self::ArchiveOverLimit => "archive exceeded safety size or entry limit",
+            Self::ArchiveCorrupt => "malformed tar framing or trailing data after zero block",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryType {
@@ -84,6 +108,9 @@ pub struct Anchor {
     pub workflow_path: Option<String>,
     pub workflow_ref: Option<String>,
     pub reachable_from_branch: Option<bool>,
+    /// Populated when a network/git error prevented checking the repository (never masquerades as `anchor_lost`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -152,11 +179,8 @@ pub enum BreakKind {
     NativeOrBinaryNew,
     RegistryManifestDiffers,
     KnownMalicious,
-    TagMoved,
     PublisherChanged,
     DependencyAdded,
-    SizeJump,
-    VersionOutOfSequence,
     AnchorUnreachable,
 }
 
@@ -178,14 +202,47 @@ impl BreakKind {
             | Self::InstallScriptChanged
             | Self::NativeOrBinaryNew
             | Self::RegistryManifestDiffers
-            | Self::KnownMalicious
-            | Self::TagMoved => BreakSeverity::Stop,
+            | Self::KnownMalicious => BreakSeverity::Stop,
             Self::UnexplainedAppeared
             | Self::PublisherChanged
             | Self::DependencyAdded
-            | Self::SizeJump
-            | Self::VersionOutOfSequence
             | Self::AnchorUnreachable => BreakSeverity::Flag,
+        }
+    }
+
+    pub fn fact_key(self) -> &'static str {
+        match self {
+            Self::AnchorLost => "break:anchor_lost",
+            Self::ProvenanceLost => "break:provenance_lost",
+            Self::RepoChanged => "break:repo_changed",
+            Self::SourceMatchDrop => "break:source_match_drop",
+            Self::UnexplainedAppeared => "flag:unexplained_appeared",
+            Self::InstallScriptNew => "break:install_script_new",
+            Self::InstallScriptChanged => "break:install_script_changed",
+            Self::NativeOrBinaryNew => "break:native_or_binary_new",
+            Self::RegistryManifestDiffers => "break:registry_manifest_differs",
+            Self::KnownMalicious => "break:known_malicious",
+            Self::PublisherChanged => "flag:publisher_changed",
+            Self::DependencyAdded => "flag:dependency_added",
+            Self::AnchorUnreachable => "flag:anchor_unreachable",
+        }
+    }
+
+    pub fn human_label(self) -> &'static str {
+        match self {
+            Self::AnchorLost => "source anchor disappeared",
+            Self::ProvenanceLost => "build provenance or trusted publishing dropped",
+            Self::RepoChanged => "source repository changed",
+            Self::SourceMatchDrop => "previously source-matched executable file is now unexplained",
+            Self::UnexplainedAppeared => "unexplained executable code appeared for the first time",
+            Self::InstallScriptNew => "install-time execution script added",
+            Self::InstallScriptChanged => "install-time execution script changed",
+            Self::NativeOrBinaryNew => "native addon or executable binary appeared",
+            Self::RegistryManifestDiffers => "registry metadata disagrees with tarball package.json",
+            Self::KnownMalicious => "listed as malicious in OSV",
+            Self::PublisherChanged => "publishing account changed",
+            Self::DependencyAdded => "new runtime dependency added",
+            Self::AnchorUnreachable => "anchor commit is not reachable from a repository branch or tag",
         }
     }
 }
@@ -219,6 +276,40 @@ impl ReachToken {
                 | Self::ShellLiteral
                 | Self::MinifiedNew
         )
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Net => "net",
+            Self::Fs => "fs",
+            Self::Env => "env",
+            Self::HostInfo => "host_info",
+            Self::BrowserSensitive => "browser_sensitive",
+            Self::Proc => "proc",
+            Self::DynCode => "dyn_code",
+            Self::Native => "native",
+            Self::InstallExec => "install_exec",
+            Self::EncodedBlob => "encoded_blob",
+            Self::ShellLiteral => "shell_literal",
+            Self::MinifiedNew => "minified_new",
+        }
+    }
+
+    pub fn human_label(self) -> &'static str {
+        match self {
+            Self::Net => "network access",
+            Self::Fs => "filesystem access",
+            Self::Env => "environment variable access",
+            Self::HostInfo => "host/user metadata access",
+            Self::BrowserSensitive => "browser cookies/storage/wallet access",
+            Self::Proc => "process execution (child_process)",
+            Self::DynCode => "dynamic code evaluation (eval/Function/vm/dynamic import)",
+            Self::Native => "native addon / binary loading",
+            Self::InstallExec => "install-time script execution",
+            Self::EncodedBlob => "large encoded/high-entropy string literal",
+            Self::ShellLiteral => "shell download-and-execute pattern",
+            Self::MinifiedNew => "previously readable file became minified",
+        }
     }
 }
 
@@ -278,6 +369,26 @@ pub enum LockAlarm {
     IntegrityMissing,
 }
 
+impl LockAlarm {
+    pub fn fact_key(self) -> &'static str {
+        match self {
+            Self::SameVersionBytesChanged => "lock:same_version_bytes_changed",
+            Self::SourceKindChanged => "lock:source_kind_changed",
+            Self::RegistryHostChanged => "lock:registry_host_changed",
+            Self::IntegrityMissing => "lock:integrity_missing",
+        }
+    }
+
+    pub fn human_label(self) -> &'static str {
+        match self {
+            Self::SameVersionBytesChanged => "same package version has different tarball bytes",
+            Self::SourceKindChanged => "dependency source changed between registry and git/url/file",
+            Self::RegistryHostChanged => "registry host changed",
+            Self::IntegrityMissing => "lockfile entry is missing SHA-512 integrity",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LedgerEndpoint {
     pub version: String,
@@ -289,7 +400,17 @@ pub struct LedgerEndpoint {
     pub published_at: Option<String>,
 }
 
-/// Timeless deterministic transition ledger (no relative ages or current-clock timestamps).
+/// Compact inline diff preview for one unexplained executable/manifest file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResidualDiff {
+    pub path: String,
+    pub bytes: u64,
+    pub total_lines: usize,
+    pub truncated: bool,
+    pub diff: String,
+}
+
+/// Timeless deterministic transition ledger (no wall-clock timestamps or relative ages).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransitionLedger {
     pub kind: String,
@@ -310,11 +431,22 @@ pub struct TransitionLedger {
     pub breaks: BTreeSet<BreakKind>,
     pub flags: BTreeSet<BreakKind>,
     pub break_notes: BTreeMap<BreakKind, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisory_ids: Vec<String>,
+    #[serde(default)]
+    pub osv_unavailable: bool,
     pub new_reach: BTreeSet<ReachToken>,
     pub new_reach_in_unexplained: BTreeSet<ReachToken>,
     pub new_reach_files: BTreeMap<ReachToken, Vec<String>>,
     pub new_hostnames: BTreeSet<String>,
-    pub registry_snapshot_sha256: Option<String>,
+    /// Number of prior releases strictly older than `new.published_at` (used for thin-history direct dep gating).
+    #[serde(default)]
+    pub prior_release_count: usize,
+    /// Earliest known release timestamp for this package (RFC 3339, from historical slice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_first_published_at: Option<String>,
+    /// Hash of the deterministic historical metadata slice (not the mutable full packument).
+    pub history_slice_sha256: Option<String>,
     pub tool_version: String,
 }
 
@@ -352,7 +484,11 @@ pub enum ReleaseAgeBand {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NewDirectPolicy {
+    /// Stop only if the package has thin history (< 30 days old or < 3 prior releases).
+    ThinHistory,
+    /// Stop on every brand-new direct dependency for explicit human confirmation.
     Confirm,
+    /// Treat new direct dependencies identically to transitive ones.
     Check,
 }
 
@@ -376,10 +512,10 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            policy_version: 1,
+            policy_version: 2,
             min_age_hours: 24,
             settled_age_days: 30,
-            new_direct_dependency: NewDirectPolicy::Confirm,
+            new_direct_dependency: NewDirectPolicy::ThinHistory,
             read_pass: ReadPassPolicy::Allow,
             history_depth: 20,
         }
@@ -413,6 +549,8 @@ pub struct Decision {
     pub reading_required: bool,
     pub reading_outcome: ReadingOutcome,
     pub stop_rules: BTreeSet<StopRule>,
+    /// Concrete fact keys that caused stops; approvals bind to these exact facts (fixing S10 granularity).
+    pub stop_facts: BTreeSet<String>,
     pub stop_reasons: Vec<String>,
     pub verdict: Verdict,
 }

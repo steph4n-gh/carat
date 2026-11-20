@@ -8,7 +8,7 @@ mod render;
 use assay_core::archive::{LoadedArchive, extract_manifest_facts, inspect_tgz, strip_archive_root};
 use assay_core::canonical::{canonical_id, format_unix_rfc3339, to_canonical_json};
 use assay_core::config::AssayConfig;
-use assay_core::digest::sha512_hex;
+use assay_core::digest::sha256_hex;
 use assay_core::history::HistoryContext;
 use assay_core::lockfile::{
     LockTransition, deduplicate_transitions, diff_lockfiles, parse_lockfile_packages,
@@ -17,7 +17,7 @@ use assay_core::model::{
     ArchiveLimits, LockAlarm, ReadingOutcome, ReferenceStanding, StopRule, Verdict,
 };
 use assay_core::normalize::registry_manifest_differs;
-use assay_core::packet::{PacketBudgets, build_reading_packet};
+use assay_core::packet::{PacketBudgets, build_inline_residual_diffs, build_reading_packet};
 use assay_core::policy::{
     TransitionInput, build_artifact_profile, build_transition_ledger, evaluate_decision,
 };
@@ -37,9 +37,13 @@ use render::{TransitionReportItem, render_change_summary, render_explain_markdow
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const DEFAULT_CONFIG_TOML: &str = include_str!("../../../assay.toml.example");
+const DEFAULT_GITHUB_WORKFLOW: &str = include_str!("../../../docs/workflows/assay-pr.yml");
 
 #[derive(Parser)]
 #[command(name = "assay", version, about = "A balance sheet for dependency changes")]
@@ -66,19 +70,15 @@ enum Commands {
     Explain {
         /// Transition spec, e.g. vite@8.3.7..8.3.8 or @scope/pkg@1.0.0..1.0.1
         spec: String,
-
-        /// Run the configured reader when unexplained bytes/flags/reach remain
+        /// Run the configured reader when unexplained code diffs or flags remain
         #[arg(long)]
         read: bool,
-
-        /// Explicit RFC 3339 evaluation timestamp (default: now UTC)
+        /// Explicit RFC 3339 evaluation timestamp (for historical backtesting only)
         #[arg(long)]
         as_of: Option<String>,
-
-        /// Skip OSV advisory lookup (useful for zero-day backtesting)
+        /// Skip OSV advisory lookup (for zero-day backtesting only)
         #[arg(long)]
         no_osv: bool,
-
         /// Save an offline input bundle under .assay/inputs/<ledger_id> for `assay replay`
         #[arg(long)]
         save_inputs: bool,
@@ -98,8 +98,6 @@ enum Commands {
         read: bool,
         #[arg(long)]
         as_of: Option<String>,
-        #[arg(long)]
-        no_osv: bool,
     },
 
     /// Check a pull request reading both revisions strictly from Git objects (never executes PR head)
@@ -122,34 +120,26 @@ enum Commands {
         pr_author: Option<String>,
         #[arg(long)]
         read: bool,
-        #[arg(long)]
-        as_of: Option<String>,
-        #[arg(long)]
-        no_osv: bool,
     },
 
-    /// Check adding or updating an npm dependency BEFORE installing it (safe agent gate)
+    /// Resolve, check, and optionally install an npm dependency (exact checked bytes only)
     Add {
         /// Package specifier, e.g. zod or zod@4.6.7
         package: String,
         /// Project directory containing package.json / package-lock.json
         #[arg(long, default_value = ".")]
         project_dir: PathBuf,
-        /// Run the configured reader when unexplained bytes/flags/reach remain
+        /// Run the configured reader when unexplained code diffs or flags remain
         #[arg(long)]
         read: bool,
-        /// If every transition passes, run `npm install <package>` automatically
+        /// If every transition passes, write the exact checked lockfile and run `npm ci --ignore-scripts`
         #[arg(long)]
         install: bool,
-        #[arg(long)]
-        as_of: Option<String>,
-        #[arg(long)]
-        no_osv: bool,
     },
 
-    /// Record a human approval bound to a transition subject
+    /// Record a human approval bound to a transition subject and exact stop facts
     Approve {
-        /// Full or prefix subject hex ID from a stop report
+        /// Unique subject hex ID or prefix (>= 8 hex chars) from a stop report
         subject: String,
         /// Approver name (defaults to $USER)
         #[arg(long)]
@@ -157,6 +147,9 @@ enum Commands {
         /// Optional approval rationale
         #[arg(long)]
         note: Option<String>,
+        /// Allow running without an interactive terminal (for human-invoked scripts/tests only)
+        #[arg(long)]
+        non_interactive: bool,
     },
 
     /// Report where and when given package bytes were admitted (Git history + local store)
@@ -239,7 +232,6 @@ fn main() -> ExitCode {
             head_pkg,
             read,
             as_of,
-            no_osv,
         } => match run_check_files(
             &base,
             &head,
@@ -247,11 +239,8 @@ fn main() -> ExitCode {
             head_pkg.as_deref(),
             read,
             as_of,
-            no_osv,
             &store_root,
             &cfg,
-            &[],
-            &[],
             cli.json,
         ) {
             Ok(passed) => if passed { ExitCode::from(0) } else { ExitCode::from(1) },
@@ -269,8 +258,6 @@ fn main() -> ExitCode {
             comments_json,
             pr_author,
             read,
-            as_of,
-            no_osv,
         } => match run_pr(
             &repo,
             &base,
@@ -280,8 +267,6 @@ fn main() -> ExitCode {
             comments_json.as_deref(),
             pr_author.as_deref(),
             read,
-            as_of,
-            no_osv,
             &store_root,
             cli.json,
         ) {
@@ -296,30 +281,57 @@ fn main() -> ExitCode {
             project_dir,
             read,
             install,
-            as_of,
-            no_osv,
-        } => match run_add(&package, &project_dir, read, install, as_of, no_osv, &store_root, &cfg, cli.json) {
-            Ok(passed) => if passed { ExitCode::from(0) } else { ExitCode::from(1) },
+        } => match execute_add(&package, &project_dir, read, install, &store_root, &cfg) {
+            Ok(res) => {
+                if let Err(e) = emit_change_report(
+                    &res.items,
+                    &[],
+                    &res.transition_errors,
+                    res.passed,
+                    cli.json,
+                ) {
+                    eprintln!("assay error: {e}");
+                    return ExitCode::from(2);
+                }
+                if res.installed && !cli.json {
+                    println!("Installed exact checked lockfile via `npm ci --ignore-scripts`.");
+                }
+                if res.passed {
+                    ExitCode::from(0)
+                } else {
+                    ExitCode::from(1)
+                }
+            }
             Err(e) => {
                 eprintln!("assay error: {e}");
                 ExitCode::from(2)
             }
         },
-        Commands::Approve { subject, by, note } => {
-            match run_approve(&subject, by, note, &store_root, &cfg, cli.json) {
-                Ok(()) => ExitCode::from(0),
-                Err(e) => {
-                    eprintln!("assay error: {e}");
-                    ExitCode::from(2)
-                }
+        Commands::Approve {
+            subject,
+            by,
+            note,
+            non_interactive,
+        } => match run_approve(&subject, by, note, non_interactive, &store_root, &cfg, cli.json) {
+            Ok(()) => ExitCode::from(0),
+            Err(e) => {
+                eprintln!("assay error: {e}");
+                ExitCode::from(2)
             }
-        }
+        },
         Commands::Exposure {
             package,
             sha512,
             repo,
             lockfile,
-        } => match run_exposure(package.as_deref(), sha512.as_deref(), &repo, &lockfile, &store_root, cli.json) {
+        } => match run_exposure(
+            package.as_deref(),
+            sha512.as_deref(),
+            &repo,
+            &lockfile,
+            &store_root,
+            cli.json,
+        ) {
             Ok(()) => ExitCode::from(0),
             Err(e) => {
                 eprintln!("assay error: {e}");
@@ -341,10 +353,7 @@ fn main() -> ExitCode {
             }
         },
         Commands::Mcp => {
-            let dispatcher = CliMcpDispatcher {
-                store_root,
-                cfg,
-            };
+            let dispatcher = CliMcpDispatcher { store_root, cfg };
             match run_mcp_server(&dispatcher) {
                 Ok(()) => ExitCode::from(0),
                 Err(e) => {
@@ -366,83 +375,6 @@ fn main() -> ExitCode {
             }
         },
     }
-}
-
-const DEFAULT_CONFIG_TOML: &str = include_str!("../../../assay.toml.example");
-const DEFAULT_GITHUB_WORKFLOW: &str = include_str!("../../../docs/workflows/assay-pr.yml");
-
-fn run_init(
-    dir: &Path,
-    github: bool,
-    mcp: bool,
-    force: bool,
-    json_output: bool,
-) -> Result<(), String> {
-    let mut created: Vec<String> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
-
-    let cfg_path = dir.join("assay.toml");
-    if cfg_path.exists() && !force {
-        skipped.push(cfg_path.display().to_string());
-    } else {
-        fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-        fs::write(&cfg_path, DEFAULT_CONFIG_TOML)
-            .map_err(|e| format!("write {}: {e}", cfg_path.display()))?;
-        created.push(cfg_path.display().to_string());
-    }
-
-    if github {
-        let wf_dir = dir.join(".github").join("workflows");
-        let wf_path = wf_dir.join("assay-pr.yml");
-        if wf_path.exists() && !force {
-            skipped.push(wf_path.display().to_string());
-        } else {
-            fs::create_dir_all(&wf_dir).map_err(|e| format!("mkdir {}: {e}", wf_dir.display()))?;
-            fs::write(&wf_path, DEFAULT_GITHUB_WORKFLOW)
-                .map_err(|e| format!("write {}: {e}", wf_path.display()))?;
-            created.push(wf_path.display().to_string());
-        }
-    }
-
-    let exe_path = std::env::current_exe()
-        .ok()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "assay".to_string());
-    let mcp_config = json!({
-        "mcpServers": {
-            "assay": {
-                "command": exe_path,
-                "args": ["mcp"],
-                "env": {
-                    "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}"
-                }
-            }
-        }
-    });
-
-    if json_output {
-        let out = json!({
-            "created": created,
-            "skipped": skipped,
-            "mcp_config": mcp_config,
-        });
-        println!("{}", to_canonical_json(&out)?);
-    } else {
-        for p in &created {
-            println!("Created {p}");
-        }
-        for p in &skipped {
-            println!("Skipped {p} (already exists; pass --force to overwrite)");
-        }
-        if mcp {
-            println!("\nMCP config (paste into your coding agent settings):");
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&mcp_config).unwrap_or_default()
-            );
-        }
-    }
-    Ok(())
 }
 
 fn load_config(explicit: Option<&Path>) -> Result<AssayConfig, String> {
@@ -526,7 +458,6 @@ fn evaluate_single_transition(
         .get(new_ver)
         .ok_or_else(|| format!("version {new_ver} not found for {name}"))?;
 
-    // Resolve reference artifact: explicit admitted version, else newest settled release (SPEC 7.1).
     let (chosen_ref_ver, ref_standing) = match ref_ver_opt {
         Some(rv) => (Some(rv.to_string()), ReferenceStanding::Admitted),
         None => match fetcher.find_settled_reference_version(
@@ -609,28 +540,30 @@ fn evaluate_single_transition(
     );
     let _ = store.save_profile(&new_profile);
 
-    let (prior_releases, new_release_summary) =
-        build_release_history(&reg_doc.json, new_ver, cfg.policy.history_depth);
+    let hist_slice = build_release_history(&reg_doc.json, new_ver, cfg.policy.history_depth);
 
     let reg_manifest_diffs = new_archive
         .contents
         .iter()
         .find(|(p, _)| strip_archive_root(p) == "package.json")
-        .map(|(_, bytes)| registry_manifest_differs(bytes, new_reg))
+        .map(|(_, bytes)| registry_manifest_differs(bytes, new_reg, new_manifest.has_binding_gyp))
         .unwrap_or_default();
 
-    let known_malicious_ids = if opts.no_osv {
-        Vec::new()
+    let (known_malicious_ids, osv_unavailable) = if opts.no_osv {
+        (Vec::new(), false)
     } else {
         fetcher.query_osv(name, new_ver, Some(opts.as_of))
     };
 
     let history_ctx = HistoryContext {
-        prior_releases,
-        new_release: new_release_summary.clone(),
+        prior_releases: hist_slice.prior_releases,
+        total_prior_releases: hist_slice.total_prior_releases,
+        package_first_published_at: hist_slice.first_published_at,
+        new_release: hist_slice.new_release.clone(),
         reference_had_anchor: ref_anchor_found,
         registry_manifest_diffs: reg_manifest_diffs,
         known_malicious_ids,
+        osv_unavailable,
         is_new_to_project: opts.is_new_to_project,
     };
 
@@ -644,12 +577,16 @@ fn evaluate_single_transition(
         new_archive: &new_archive,
         new_profile: &new_profile,
         new_source: new_source.as_ref(),
-        new_published_at: new_release_summary.published_at.clone(),
+        new_published_at: hist_slice.new_release.published_at.clone(),
         lock_alarms: opts.lock_alarms,
         history_ctx,
-        registry_snapshot_sha256: Some(reg_doc.raw_sha256.clone()),
+        history_slice_sha256: Some(hist_slice.slice_sha256.clone()),
     })?;
     let _ = store.save_ledger(&ledger);
+
+    // Inline leftover code diffs (the 30-second wedge!)
+    let residual_diffs =
+        build_inline_residual_diffs(&ledger, ref_archive.as_ref(), &new_archive, 4, 40);
 
     // Optional offline replay input bundle
     if opts.save_inputs {
@@ -660,12 +597,10 @@ fn evaluate_single_transition(
         }
         let ref_tgz_name = ref_archive.as_ref().and_then(|ra| {
             let fname = format!("{}.tgz", ra.inventory.sha512);
-            fetcher
-                .read_cached_tarball(&ra.inventory.sha512)
-                .map(|b| {
-                    bundle_files.push((fname.clone(), b));
-                    fname
-                })
+            fetcher.read_cached_tarball(&ra.inventory.sha512).map(|b| {
+                bundle_files.push((fname.clone(), b));
+                fname
+            })
         });
         bundle_files.push(("registry.json".into(), reg_doc.raw_bytes.clone()));
 
@@ -691,7 +626,9 @@ fn evaluate_single_transition(
             reference_sha512: ref_archive.as_ref().map(|a| a.inventory.sha512.clone()),
             reference_published_at: ref_published_at,
             reference_anchor: ref_profile.as_ref().map(|p| p.anchor.clone()),
-            reference_source_package_dir: ref_source_snap.as_ref().and_then(|s| s.package_dir.clone()),
+            reference_source_package_dir: ref_source_snap
+                .as_ref()
+                .and_then(|s| s.package_dir.clone()),
             reference_source_tree: ref_source_snap
                 .as_ref()
                 .map(|s| s.tree_blob_sha1.clone())
@@ -700,7 +637,7 @@ fn evaluate_single_transition(
             new_version: new_ver.into(),
             new_tarball_file: new_tgz_name,
             new_sha512: new_archive.inventory.sha512.clone(),
-            new_published_at: new_release_summary.published_at,
+            new_published_at: hist_slice.new_release.published_at,
             new_anchor: new_anchor.clone(),
             new_source_package_dir: new_source.as_ref().and_then(|s| s.package_dir.clone()),
             new_source_tree: new_source
@@ -709,7 +646,7 @@ fn evaluate_single_transition(
                 .unwrap_or_default(),
             new_source_blobs_b64: source_blobs_b64,
             registry_snapshot_file: Some("registry.json".into()),
-            registry_snapshot_sha256: Some(reg_doc.raw_sha256),
+            history_slice_sha256: Some(hist_slice.slice_sha256),
             as_of: opts.as_of.into(),
             expected_ledger_id: ledger_id.clone(),
         };
@@ -721,7 +658,6 @@ fn evaluate_single_transition(
         let _ = store.save_input_bundle(&ledger_id, &bundle, &refs);
     }
 
-    // Preliminary deterministic evaluation to see if reading is required
     let prelim = evaluate_decision(
         &ledger,
         &ledger_id,
@@ -745,15 +681,20 @@ fn evaluate_single_transition(
 
     if should_read {
         let reading_cache_key = format!(
-            "{}-{}-{}",
+            "{}-{}",
             &ledger_id[..24],
-            cfg.reader.model.replace('/', "_"),
-            cfg.readings
+            cfg.reader.model.replace('/', "_")
         );
+        // Only reuse cached COMPLETED assessments (never reuse cached Unavailable / Invalid outages!).
         if let Some(cached_json) = store.load_reading_json(&reading_cache_key) {
             if let Ok(rec) = serde_json::from_str::<ReadingRecord>(&cached_json) {
-                reading_outcome = rec.outcome;
-                reading_record = Some(rec);
+                if matches!(
+                    rec.outcome,
+                    ReadingOutcome::Passed | ReadingOutcome::Concern | ReadingOutcome::Refused
+                ) {
+                    reading_outcome = rec.outcome;
+                    reading_record = Some(rec);
+                }
             }
         }
         if reading_record.is_none() {
@@ -779,53 +720,35 @@ fn evaluate_single_transition(
                 PacketBudgets::default(),
             )?;
 
-            // If every unexplained file was non-executable (d.ts / map / doc) and no flags/reach exist,
-            // packet.units may be empty. Still run reader if flags/reach exist, else pass cleanly.
-            let rec = if packet.units.is_empty()
-                && ledger.flags.is_empty()
-                && ledger.new_reach.is_empty()
-            {
-                ReadingRecord {
-                    kind: "reading".into(),
-                    schema: 1,
-                    ledger_id: ledger_id.clone(),
-                    packet_hash: packet.packet_hash.clone(),
-                    model: cfg.reader.model.clone(),
-                    instruction_hash: assay_core::reader::instruction_hash(),
-                    units: Vec::new(),
-                    findings: Vec::new(),
-                    dropped_findings: 0,
-                    summary: "Only non-executable declaration/map/doc files were unexplained.".into(),
-                    outcome: ReadingOutcome::Passed,
-                    error_detail: None,
-                }
-            } else {
-                let exec_cfg = ReaderExecConfig {
-                    command: cfg.reader.command.clone(),
-                    model: cfg.reader.model.clone(),
-                    effort: cfg.reader.effort.clone(),
-                    readings: cfg.readings,
-                    timeout_secs: cfg.reader.timeout_secs,
-                };
-                run_reading(&packet, &ledger_id, &exec_cfg)
+            let exec_cfg = ReaderExecConfig {
+                command: cfg.reader.command.clone(),
+                model: cfg.reader.model.clone(),
+                effort: cfg.reader.effort.clone(),
+                timeout_secs: cfg.reader.timeout_secs,
             };
-
+            let rec = run_reading(&packet, &ledger_id, &exec_cfg);
             reading_outcome = rec.outcome;
-            if let Ok(canon) = to_canonical_json(&rec) {
-                let _ = store.save_reading_json(&reading_cache_key, &canon);
+            // Persist ONLY completed assessments so an API outage never poisons the cache.
+            if matches!(
+                rec.outcome,
+                ReadingOutcome::Passed | ReadingOutcome::Concern | ReadingOutcome::Refused
+            ) {
+                if let Ok(canon) = to_canonical_json(&rec) {
+                    let _ = store.save_reading_json(&reading_cache_key, &canon);
+                }
             }
             reading_record = Some(rec);
         }
     }
 
-    // Check existing approval in store or PR comments (enforcing S10 staleness!)
+    // Check granular approval in store (exact approved_facts) or PR comments.
     let store_approval = store.find_approval(&ledger.subject);
     let pr_approval = opts
         .pr_approvals
         .iter()
         .find(|a| ledger.subject.starts_with(&a.subject));
 
-    let prior_rules = store_approval.as_ref().map(|a| &a.approved_stop_rules);
+    let prior_facts = store_approval.as_ref().map(|a| &a.approved_facts);
     let decision = evaluate_decision(
         &ledger,
         &ledger_id,
@@ -833,24 +756,31 @@ fn evaluate_single_transition(
         opts.as_of,
         opts.is_new_direct,
         reading_outcome,
-        prior_rules,
+        prior_facts,
     );
     let _ = store.save_decision(&decision);
 
-    let approved_by = if decision.verdict == Verdict::Stop && !decision.stop_rules.contains(&StopRule::S10) {
-        if let Some(ref sa) = store_approval {
-            Some(sa.approver.clone())
+    let approved_by =
+        if decision.verdict == Verdict::Stop && !decision.stop_rules.contains(&StopRule::S10) {
+            if let Some(ref sa) = store_approval {
+                Some(sa.approver.clone())
+            } else {
+                // PR comment approval: disallow silently approving known_malicious advisories without explicit store record
+                if ledger.advisory_ids.is_empty() {
+                    pr_approval.map(|pa| pa.approver.clone())
+                } else {
+                    None
+                }
+            }
         } else {
-            pr_approval.map(|pa| pa.approver.clone())
-        }
-    } else {
-        None
-    };
+            None
+        };
 
     Ok(TransitionReportItem {
         ledger,
         decision,
         reading: reading_record,
+        residual_diffs,
         route: Vec::new(),
         approved_by,
     })
@@ -898,21 +828,13 @@ fn run_explain(
             "ledger_id": item.decision.ledger_id,
             "ledger": item.ledger,
             "decision": item.decision,
+            "residual_diffs": item.residual_diffs,
             "reading": item.reading,
             "approved_by": item.approved_by,
         });
         println!("{}", to_canonical_json(&out)?);
     } else {
-        print!(
-            "{}",
-            render_explain_markdown(
-                &item.ledger,
-                &item.decision,
-                item.reading.as_ref(),
-                &item.route,
-                item.approved_by.as_deref()
-            )
-        );
+        print!("{}", render_explain_markdown(&item));
     }
 
     Ok(item.decision.verdict != Verdict::Stop || item.approved_by.is_some())
@@ -926,31 +848,41 @@ fn run_check_bytes(
     head_pkg: Option<&[u8]>,
     read: bool,
     as_of: &str,
-    no_osv: bool,
     store_root: &Path,
     cfg: &AssayConfig,
     tampered_files: &[String],
     pr_approvals: &[pr::ParsedPrApproval],
-) -> Result<(Vec<TransitionReportItem>, bool), String> {
+) -> Result<(Vec<TransitionReportItem>, Vec<String>, bool), String> {
     let diff = diff_lockfiles(base_lock, head_lock, base_pkg, head_pkg)?;
     let unique = deduplicate_transitions(&diff.transitions);
     let fetcher = Fetcher::new(store_root.join("cache"))?;
     let store = open_store(store_root, cfg)?;
 
     let mut items = Vec::with_capacity(unique.len());
+    let mut transition_errors = Vec::new();
     for (t, _paths) in unique {
         if t.in_bundle && t.new_resolved.is_none() {
             continue;
         }
-        let item = eval_lock_transition(&fetcher, &store, cfg, &t, read, as_of, no_osv, pr_approvals)?;
-        items.push(item);
+        // Per-transition isolation: one unfetchable/private/non-registry package stops that transition
+        // instead of crashing the entire check with exit 2.
+        match eval_lock_transition(&fetcher, &store, cfg, &t, read, as_of, pr_approvals) {
+            Ok(item) => items.push(item),
+            Err(e) => transition_errors.push(format!(
+                "{}@{} ({}): {e}",
+                t.name,
+                t.new_version.as_deref().unwrap_or("?"),
+                t.instance_path
+            )),
+        }
     }
 
     let all_passed = tampered_files.is_empty()
+        && transition_errors.is_empty()
         && items
             .iter()
             .all(|i| i.decision.verdict != Verdict::Stop || i.approved_by.is_some());
-    Ok((items, all_passed))
+    Ok((items, transition_errors, all_passed))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -961,7 +893,6 @@ fn eval_lock_transition(
     t: &LockTransition,
     read: bool,
     as_of: &str,
-    no_osv: bool,
     pr_approvals: &[pr::ParsedPrApproval],
 ) -> Result<TransitionReportItem, String> {
     let new_ver = t
@@ -989,7 +920,7 @@ fn eval_lock_transition(
         EvalOptions {
             read,
             as_of,
-            no_osv,
+            no_osv: false,
             save_inputs: false,
             is_new_direct: t.is_new_direct,
             is_new_to_project: t.ref_version.is_none(),
@@ -1009,11 +940,8 @@ fn run_check_files(
     head_pkg: Option<&Path>,
     read: bool,
     as_of_opt: Option<String>,
-    no_osv: bool,
     store_root: &Path,
     cfg: &AssayConfig,
-    tampered_files: &[String],
-    pr_approvals: &[pr::ParsedPrApproval],
     json_output: bool,
 ) -> Result<bool, String> {
     let base_lock = fs::read(base).map_err(|e| format!("read {}: {e}", base.display()))?;
@@ -1022,54 +950,65 @@ fn run_check_files(
     let hp = head_pkg.and_then(|p| fs::read(p).ok());
     let as_of = as_of_opt.unwrap_or_else(now_rfc3339);
 
-    let (items, passed) = run_check_bytes(
+    let (items, transition_errors, passed) = run_check_bytes(
         &base_lock,
         &head_lock,
         bp.as_deref(),
         hp.as_deref(),
         read,
         &as_of,
-        no_osv,
         store_root,
         cfg,
-        tampered_files,
-        pr_approvals,
+        &[],
+        &[],
     )?;
 
-    emit_change_report(&items, tampered_files, passed, json_output)?;
+    emit_change_report(&items, &[], &transition_errors, passed, json_output)?;
     Ok(passed)
 }
 
 fn emit_change_report(
     items: &[TransitionReportItem],
     tampered_files: &[String],
+    transition_errors: &[String],
     passed: bool,
     json_output: bool,
 ) -> Result<(), String> {
     if json_output {
-        let transitions_json: Vec<Value> = items
-            .iter()
-            .map(|i| {
-                json!({
-                    "ledger_id": i.decision.ledger_id,
-                    "ledger": i.ledger,
-                    "decision": i.decision,
-                    "reading": i.reading,
-                    "route": i.route,
-                    "approved_by": i.approved_by,
-                })
-            })
-            .collect();
-        let out = json!({
-            "passed": passed,
-            "tampered_protected_files": tampered_files,
-            "transitions": transitions_json,
-        });
+        let out = change_report_json(items, tampered_files, transition_errors, passed);
         println!("{}", to_canonical_json(&out)?);
     } else {
-        print!("{}", render_change_summary(items, tampered_files));
+        print!("{}", render_change_summary(items, tampered_files, transition_errors));
     }
     Ok(())
+}
+
+fn change_report_json(
+    items: &[TransitionReportItem],
+    tampered_files: &[String],
+    transition_errors: &[String],
+    passed: bool,
+) -> Value {
+    let transitions_json: Vec<Value> = items
+        .iter()
+        .map(|i| {
+            json!({
+                "ledger_id": i.decision.ledger_id,
+                "ledger": i.ledger,
+                "decision": i.decision,
+                "residual_diffs": i.residual_diffs,
+                "reading": i.reading,
+                "route": i.route,
+                "approved_by": i.approved_by,
+            })
+        })
+        .collect();
+    json!({
+        "passed": passed,
+        "tampered_protected_files": tampered_files,
+        "transition_errors": transition_errors,
+        "transitions": transitions_json,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1082,14 +1021,12 @@ fn run_pr(
     comments_json: Option<&Path>,
     pr_author: Option<&str>,
     read: bool,
-    as_of_opt: Option<String>,
-    no_osv: bool,
     store_root: &Path,
     json_output: bool,
 ) -> Result<bool, String> {
-    let as_of = as_of_opt.unwrap_or_else(now_rfc3339);
+    let as_of = now_rfc3339();
     let changed_paths = list_changed_paths(repo, base, head)?;
-    let tampered = detect_protected_file_tampering(&changed_paths);
+    let mut tampered = detect_protected_file_tampering(&changed_paths);
 
     // Policy MUST come strictly from protected base revision (SPEC 8 & 10.3).
     let base_cfg = match read_git_file(repo, base, "assay.toml")?
@@ -1114,81 +1051,98 @@ fn run_pr(
         _ => Vec::new(),
     };
 
-    let base_lock = read_git_file(repo, base, lockfile)?
-        .unwrap_or_else(|| br#"{"lockfileVersion":3,"packages":{"":{}}}"#.to_vec());
-    let head_lock = match read_git_file(repo, head, lockfile)? {
-        Some(b) => b,
-        None => {
-            emit_change_report(&[], &tampered, tampered.is_empty(), json_output)?;
-            return Ok(tampered.is_empty());
-        }
+    let base_lock_opt = read_git_file(repo, base, lockfile)?;
+    let head_lock_opt = read_git_file(repo, head, lockfile)?;
+
+    // Security fix: deleting the lockfile in a PR MUST hard-stop rather than silently passing!
+    if base_lock_opt.is_some() && head_lock_opt.is_none() {
+        tampered.push(format!("{lockfile} (deleted in PR)"));
+        emit_change_report(&[], &tampered, &[], false, json_output)?;
+        return Ok(false);
+    }
+
+    let Some(head_lock) = head_lock_opt else {
+        emit_change_report(&[], &tampered, &[], tampered.is_empty(), json_output)?;
+        return Ok(tampered.is_empty());
     };
+    let base_lock =
+        base_lock_opt.unwrap_or_else(|| br#"{"lockfileVersion":3,"packages":{"":{}}}"#.to_vec());
     let base_pkg = read_git_file(repo, base, manifest)?;
     let head_pkg = read_git_file(repo, head, manifest)?;
 
-    let (items, passed) = run_check_bytes(
+    let (items, transition_errors, passed) = run_check_bytes(
         &base_lock,
         &head_lock,
         base_pkg.as_deref(),
         head_pkg.as_deref(),
         read,
         &as_of,
-        no_osv,
         store_root,
         &base_cfg,
         &tampered,
         &pr_approvals,
     )?;
 
-    emit_change_report(&items, &tampered, passed, json_output)?;
+    emit_change_report(&items, &tampered, &transition_errors, passed, json_output)?;
     Ok(passed)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_add(
+struct AddResult {
+    items: Vec<TransitionReportItem>,
+    transition_errors: Vec<String>,
+    passed: bool,
+    installed: bool,
+}
+
+/// Shared "resolve once, check once, install those exact bytes" engine used by BOTH CLI and MCP!
+fn execute_add(
     package: &str,
     project_dir: &Path,
     read: bool,
     install: bool,
-    as_of_opt: Option<String>,
-    no_osv: bool,
     store_root: &Path,
     cfg: &AssayConfig,
-    json_output: bool,
-) -> Result<bool, String> {
-    let as_of = as_of_opt.unwrap_or_else(now_rfc3339);
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "assay-add-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ));
+) -> Result<AddResult, String> {
+    let as_of = now_rfc3339();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_dir = std::env::temp_dir().join(format!("assay-add-{}-{nonce}", std::process::id()));
     fs::create_dir_all(&tmp_dir).map_err(|e| format!("create temp dir: {e}"))?;
 
     let base_pkg_path = project_dir.join("package.json");
     let base_lock_path = project_dir.join("package-lock.json");
+    let had_base_pkg = base_pkg_path.exists();
+    let had_base_lock = base_lock_path.exists();
 
-    let base_pkg_bytes = if base_pkg_path.exists() {
+    let base_pkg_bytes = if had_base_pkg {
         fs::read(&base_pkg_path).map_err(|e| format!("read package.json: {e}"))?
     } else {
-        br#"{"name":"assay-scratch","version":"0.0.0","private":true}"#.to_vec()
+        br#"{"name":"assay-project","version":"0.0.0","private":true}"#.to_vec()
     };
-    let base_lock_bytes = if base_lock_path.exists() {
+    let base_lock_bytes = if had_base_lock {
         fs::read(&base_lock_path).map_err(|e| format!("read package-lock.json: {e}"))?
     } else {
         br#"{"lockfileVersion":3,"packages":{"":{}}}"#.to_vec()
     };
 
+    let base_pkg_hash = sha256_hex(&base_pkg_bytes);
+    let base_lock_hash = sha256_hex(&base_lock_bytes);
+
+    // Copy .npmrc if present so private/custom registry configs are surfaced honestly rather than silently dropped.
+    if project_dir.join(".npmrc").exists() {
+        let _ = fs::copy(project_dir.join(".npmrc"), tmp_dir.join(".npmrc"));
+    }
+
     fs::write(tmp_dir.join("package.json"), &base_pkg_bytes)
         .map_err(|e| format!("write temp package.json: {e}"))?;
-    if base_lock_path.exists() {
+    if had_base_lock {
         fs::write(tmp_dir.join("package-lock.json"), &base_lock_bytes)
             .map_err(|e| format!("write temp package-lock.json: {e}"))?;
     }
 
-    // Resolve full transitive lockfile safely: never run lifecycle scripts or mutate project_dir.
+    // Resolve ONCE in isolated temp dir with scripts disabled.
     let npm_out = Command::new("npm")
         .current_dir(&tmp_dir)
         .args([
@@ -1214,57 +1168,91 @@ fn run_add(
         .map_err(|e| format!("read resolved package.json: {e}"))?;
     let _ = fs::remove_dir_all(&tmp_dir);
 
-    let (items, passed) = run_check_bytes(
+    let (items, transition_errors, passed) = run_check_bytes(
         &base_lock_bytes,
         &head_lock_bytes,
         Some(&base_pkg_bytes),
         Some(&head_pkg_bytes),
         read,
         &as_of,
-        no_osv,
         store_root,
         cfg,
         &[],
         &[],
     )?;
 
-    emit_change_report(&items, &[], passed, json_output)?;
-
+    let mut installed = false;
     if passed && install {
-        let inst_out = Command::new("npm")
+        // Verify project manifest & lockfile were not modified concurrently during check (zero TOCTOU!).
+        if had_base_pkg {
+            let cur = fs::read(&base_pkg_path)
+                .map_err(|e| format!("re-read package.json before install: {e}"))?;
+            if sha256_hex(&cur) != base_pkg_hash {
+                return Err(
+                    "package.json changed on disk during Assay check; refusing to overwrite".into(),
+                );
+            }
+        }
+        if had_base_lock {
+            let cur = fs::read(&base_lock_path)
+                .map_err(|e| format!("re-read package-lock.json before install: {e}"))?;
+            if sha256_hex(&cur) != base_lock_hash {
+                return Err(
+                    "package-lock.json changed on disk during Assay check; refusing to overwrite"
+                        .into(),
+                );
+            }
+        }
+
+        // Write the EXACT checked manifest & lockfile, then install strictly from that lockfile (`npm ci --ignore-scripts`).
+        fs::write(&base_pkg_path, &head_pkg_bytes)
+            .map_err(|e| format!("write checked package.json: {e}"))?;
+        fs::write(&base_lock_path, &head_lock_bytes)
+            .map_err(|e| format!("write checked package-lock.json: {e}"))?;
+
+        let ci_out = Command::new("npm")
             .current_dir(project_dir)
-            .args(["install", "--ignore-scripts", package])
+            .args(["ci", "--ignore-scripts", "--no-audit", "--no-fund"])
             .output()
-            .map_err(|e| format!("failed spawning npm install: {e}"))?;
-        if !inst_out.status.success() {
+            .map_err(|e| format!("failed spawning npm ci: {e}"))?;
+        if !ci_out.status.success() {
             return Err(format!(
-                "npm install failed: {}",
-                String::from_utf8_lossy(&inst_out.stderr).trim()
+                "npm ci --ignore-scripts failed: {}",
+                String::from_utf8_lossy(&ci_out.stderr).trim()
             ));
         }
+        installed = true;
     }
 
-    Ok(passed)
+    Ok(AddResult {
+        items,
+        transition_errors,
+        passed,
+        installed,
+    })
 }
 
 fn run_approve(
     subject_query: &str,
     by: Option<String>,
     note: Option<String>,
+    non_interactive: bool,
     store_root: &Path,
     cfg: &AssayConfig,
     json_output: bool,
 ) -> Result<(), String> {
+    if !non_interactive && !std::io::stdin().is_terminal() {
+        return Err(
+            "assay approve requires an interactive human terminal (refusing non-TTY agent call; humans scripting approvals may pass --non-interactive)".into(),
+        );
+    }
+
     let store = open_store(store_root, cfg)?;
-    let (ledger_id, ledger) = store
-        .find_latest_ledger_for_subject(subject_query)
-        .ok_or_else(|| {
-            format!("no recorded ledger found in {} matching subject '{subject_query}'", store_root.display())
-        })?;
+    let (ledger_id, ledger) = store.find_unique_ledger_for_subject(subject_query)?;
 
     let now = now_rfc3339();
-    let approved_stop_rules = match store.load_decision_for_subject(&ledger.subject) {
-        Some(prev_dec) => prev_dec.stop_rules,
+    let approved_facts = match store.load_decision_for_subject(&ledger.subject) {
+        Some(prev_dec) => prev_dec.stop_facts,
         None => evaluate_decision(
             &ledger,
             &ledger_id,
@@ -1274,7 +1262,7 @@ fn run_approve(
             ReadingOutcome::NotRun,
             None,
         )
-        .stop_rules,
+        .stop_facts,
     };
 
     let approver = by
@@ -1283,10 +1271,10 @@ fn run_approve(
 
     let approval = ApprovalRecord {
         kind: "approval".to_string(),
-        schema: 1,
+        schema: 2,
         subject: ledger.subject.clone(),
         ledger_id,
-        approved_stop_rules,
+        approved_facts,
         approver,
         approved_at: now,
         note,
@@ -1297,11 +1285,12 @@ fn run_approve(
         println!("{}", to_canonical_json(&approval)?);
     } else {
         println!(
-            "Approved {} ({} -> {}) by {} -> {}",
+            "Approved {} ({} -> {}) by {} for {} fact(s) -> {}",
             &approval.subject[..16],
             ledger.name,
             ledger.new.version,
             approval.approver,
+            approval.approved_facts.len(),
             saved_path.display()
         );
     }
@@ -1331,7 +1320,11 @@ fn run_exposure(
         });
         println!("{}", to_canonical_json(&out)?);
     } else if git_hits.is_empty() && store_hits.is_empty() {
-        println!("No exposure found in {} or {}.", repo.display(), store_root.display());
+        println!(
+            "No exposure found in {} or {}.",
+            repo.display(),
+            store_root.display()
+        );
     } else {
         for h in &git_hits {
             println!(
@@ -1361,7 +1354,10 @@ fn run_exposure(
 fn run_inventory(lock: &Path, json_output: bool) -> Result<(), String> {
     let bytes = fs::read(lock).map_err(|e| format!("read {}: {e}", lock.display()))?;
     let pkgs = parse_lockfile_packages(&bytes)?;
-    let missing_integrity = pkgs.iter().filter(|p| p.sha512.is_none() && !p.in_bundle).count();
+    let missing_integrity = pkgs
+        .iter()
+        .filter(|p| p.sha512.is_none() && !p.in_bundle)
+        .count();
     let non_registry = pkgs
         .iter()
         .filter(|p| p.source_kind != assay_core::lockfile::SourceKind::Registry && !p.in_bundle)
@@ -1396,6 +1392,7 @@ fn run_replay(
     let new_bytes = fs::read(bundle_dir.join(&bundle.new_tarball_file))
         .map_err(|e| format!("read bundle tarball {}: {e}", bundle.new_tarball_file))?;
     let new_archive = inspect_tgz(&new_bytes, Some(&bundle.new_sha512), limits)?;
+    let new_manifest = extract_manifest_facts(&new_archive);
 
     let mut blobs_by_sha1 = BTreeMap::new();
     for (k, b64) in &bundle.new_source_blobs_b64 {
@@ -1460,14 +1457,13 @@ fn run_replay(
         _ => (None, None, ReferenceStanding::None),
     };
 
-    let (prior_releases, new_release_summary, reg_diffs) = match &bundle.registry_snapshot_file {
+    let (history_ctx, hist_sha) = match &bundle.registry_snapshot_file {
         Some(rf) => {
             let raw = fs::read(bundle_dir.join(rf))
                 .map_err(|e| format!("read registry snapshot {rf}: {e}"))?;
             let val: Value = serde_json::from_slice(&raw)
                 .map_err(|e| format!("parse registry snapshot: {e}"))?;
-            let (prior, new_sum) =
-                build_release_history(&val, &bundle.new_version, cfg.policy.history_depth);
+            let hs = build_release_history(&val, &bundle.new_version, cfg.policy.history_depth);
             let new_reg = val
                 .pointer(&format!("/versions/{}", bundle.new_version))
                 .cloned()
@@ -1476,20 +1472,33 @@ fn run_replay(
                 .contents
                 .iter()
                 .find(|(p, _)| strip_archive_root(p) == "package.json")
-                .map(|(_, bytes)| registry_manifest_differs(bytes, &new_reg))
+                .map(|(_, bytes)| {
+                    registry_manifest_differs(bytes, &new_reg, new_manifest.has_binding_gyp)
+                })
                 .unwrap_or_default();
-            (prior, new_sum, diffs)
+            (
+                HistoryContext {
+                    prior_releases: hs.prior_releases,
+                    total_prior_releases: hs.total_prior_releases,
+                    package_first_published_at: hs.first_published_at,
+                    new_release: hs.new_release,
+                    reference_had_anchor: bundle.reference_anchor.as_ref().map(|a| a.found),
+                    registry_manifest_diffs: diffs,
+                    known_malicious_ids: Vec::new(),
+                    osv_unavailable: false,
+                    is_new_to_project: ref_archive.is_none(),
+                },
+                Some(hs.slice_sha256),
+            )
         }
-        None => (Vec::new(), Default::default(), Vec::new()),
-    };
-
-    let history_ctx = HistoryContext {
-        prior_releases,
-        new_release: new_release_summary,
-        reference_had_anchor: bundle.reference_anchor.as_ref().map(|a| a.found),
-        registry_manifest_diffs: reg_diffs,
-        known_malicious_ids: Vec::new(),
-        is_new_to_project: ref_archive.is_none(),
+        None => (
+            HistoryContext {
+                reference_had_anchor: bundle.reference_anchor.as_ref().map(|a| a.found),
+                is_new_to_project: ref_archive.is_none(),
+                ..Default::default()
+            },
+            bundle.history_slice_sha256.clone(),
+        ),
     };
 
     let (ledger, ledger_id) = build_transition_ledger(TransitionInput {
@@ -1505,9 +1514,11 @@ fn run_replay(
         new_published_at: bundle.new_published_at.clone(),
         lock_alarms: BTreeSet::new(),
         history_ctx,
-        registry_snapshot_sha256: bundle.registry_snapshot_sha256.clone(),
+        history_slice_sha256: hist_sha,
     })?;
 
+    let residual_diffs =
+        build_inline_residual_diffs(&ledger, ref_archive.as_ref(), &new_archive, 4, 40);
     let as_of = as_of_opt.unwrap_or(bundle.as_of);
     let decision = evaluate_decision(
         &ledger,
@@ -1522,14 +1533,24 @@ fn run_replay(
     let matches_expected = ledger_id == bundle.expected_ledger_id;
     let _ = canonical_id(&ledger)?;
 
+    let item = TransitionReportItem {
+        ledger,
+        decision,
+        reading: None,
+        residual_diffs,
+        route: Vec::new(),
+        approved_by: None,
+    };
+
     if json_output {
         let out = json!({
             "offline_replay": true,
             "ledger_id": ledger_id,
             "expected_ledger_id": bundle.expected_ledger_id,
             "byte_identical": matches_expected,
-            "ledger": ledger,
-            "decision": decision,
+            "ledger": item.ledger,
+            "decision": item.decision,
+            "residual_diffs": item.residual_diffs,
         });
         println!("{}", to_canonical_json(&out)?);
     } else {
@@ -1539,12 +1560,83 @@ fn run_replay(
             &bundle.expected_ledger_id[..16],
             matches_expected
         );
-        print!(
-            "{}",
-            render_explain_markdown(&ledger, &decision, None, &[], None)
-        );
+        print!("{}", render_explain_markdown(&item));
     }
-    Ok(matches_expected && decision.verdict != Verdict::Stop)
+    Ok(matches_expected && item.decision.verdict != Verdict::Stop)
+}
+
+fn run_init(
+    dir: &Path,
+    github: bool,
+    mcp: bool,
+    force: bool,
+    json_output: bool,
+) -> Result<(), String> {
+    let mut created: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+
+    let cfg_path = dir.join("assay.toml");
+    if cfg_path.exists() && !force {
+        skipped.push(cfg_path.display().to_string());
+    } else {
+        fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        fs::write(&cfg_path, DEFAULT_CONFIG_TOML)
+            .map_err(|e| format!("write {}: {e}", cfg_path.display()))?;
+        created.push(cfg_path.display().to_string());
+    }
+
+    if github {
+        let wf_dir = dir.join(".github").join("workflows");
+        let wf_path = wf_dir.join("assay-pr.yml");
+        if wf_path.exists() && !force {
+            skipped.push(wf_path.display().to_string());
+        } else {
+            fs::create_dir_all(&wf_dir).map_err(|e| format!("mkdir {}: {e}", wf_dir.display()))?;
+            fs::write(&wf_path, DEFAULT_GITHUB_WORKFLOW)
+                .map_err(|e| format!("write {}: {e}", wf_path.display()))?;
+            created.push(wf_path.display().to_string());
+        }
+    }
+
+    let exe_path = std::env::current_exe()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "assay".to_string());
+    let mcp_config = json!({
+        "mcpServers": {
+            "assay": {
+                "command": exe_path,
+                "args": ["mcp"],
+                "env": {
+                    "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}"
+                }
+            }
+        }
+    });
+
+    if json_output {
+        let out = json!({
+            "created": created,
+            "skipped": skipped,
+            "mcp_config": mcp_config,
+        });
+        println!("{}", to_canonical_json(&out)?);
+    } else {
+        for p in &created {
+            println!("Created {p}");
+        }
+        for p in &skipped {
+            println!("Skipped {p} (already exists; pass --force to overwrite)");
+        }
+        if mcp {
+            println!("\nMCP config (paste into your coding agent settings):");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&mcp_config).unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
 }
 
 struct CliMcpDispatcher {
@@ -1557,10 +1649,6 @@ impl McpDispatcher for CliMcpDispatcher {
         let as_of = now_rfc3339();
         let read = arguments
             .get("read")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let no_osv = arguments
-            .get("no_osv")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let fetcher = Fetcher::new(self.store_root.join("cache"))?;
@@ -1585,7 +1673,7 @@ impl McpDispatcher for CliMcpDispatcher {
                     EvalOptions {
                         read,
                         as_of: &as_of,
-                        no_osv,
+                        no_osv: false,
                         save_inputs: false,
                         is_new_direct: false,
                         is_new_to_project: false,
@@ -1595,9 +1683,12 @@ impl McpDispatcher for CliMcpDispatcher {
                 )?;
                 Ok(json!({
                     "ledger_id": item.decision.ledger_id,
+                    "subject": item.ledger.subject,
                     "verdict": item.decision.verdict,
                     "stop_rules": item.decision.stop_rules,
+                    "stop_facts": item.decision.stop_facts,
                     "stop_reasons": item.decision.stop_reasons,
+                    "residual_diffs": item.residual_diffs,
                     "ledger": item.ledger,
                     "reading": item.reading,
                 }))
@@ -1625,31 +1716,19 @@ impl McpDispatcher for CliMcpDispatcher {
                     .get("head_pkg")
                     .and_then(|v| v.as_str())
                     .and_then(|p| fs::read(p).ok());
-                let (items, passed) = run_check_bytes(
+                let (items, transition_errors, passed) = run_check_bytes(
                     &base_lock,
                     &head_lock,
                     base_pkg.as_deref(),
                     head_pkg.as_deref(),
                     read,
                     &as_of,
-                    no_osv,
                     &self.store_root,
                     &self.cfg,
                     &[],
                     &[],
                 )?;
-                Ok(json!({
-                    "passed": passed,
-                    "transitions": items.iter().map(|i| json!({
-                        "name": i.ledger.name,
-                        "version": i.ledger.new.version,
-                        "subject": i.ledger.subject,
-                        "verdict": i.decision.verdict,
-                        "stop_rules": i.decision.stop_rules,
-                        "stop_reasons": i.decision.stop_reasons,
-                        "reading": i.reading,
-                    })).collect::<Vec<_>>()
-                }))
+                Ok(change_report_json(&items, &[], &transition_errors, passed))
             }
             "assay_add" => {
                 let pkg = arguments
@@ -1662,63 +1741,22 @@ impl McpDispatcher for CliMcpDispatcher {
                         .and_then(|v| v.as_str())
                         .unwrap_or("."),
                 );
-                let tmp_dir = std::env::temp_dir().join(format!(
-                    "assay-mcp-add-{}-{}",
-                    std::process::id(),
-                    sha512_hex(pkg.as_bytes())[..12].to_string()
-                ));
-                fs::create_dir_all(&tmp_dir).map_err(|e| format!("create tmp: {e}"))?;
-                let base_pkg = fs::read(project_dir.join("package.json"))
-                    .unwrap_or_else(|_| br#"{"name":"scratch","version":"0.0.0","private":true}"#.to_vec());
-                let base_lock = fs::read(project_dir.join("package-lock.json"))
-                    .unwrap_or_else(|_| br#"{"lockfileVersion":3,"packages":{"":{}}}"#.to_vec());
-                fs::write(tmp_dir.join("package.json"), &base_pkg)
-                    .map_err(|e| format!("write tmp pkg: {e}"))?;
-                if project_dir.join("package-lock.json").exists() {
-                    fs::write(tmp_dir.join("package-lock.json"), &base_lock)
-                        .map_err(|e| format!("write tmp lock: {e}"))?;
+                let install = arguments
+                    .get("install")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let res = execute_add(pkg, &project_dir, read, install, &self.store_root, &self.cfg)?;
+                let mut report = change_report_json(&res.items, &[], &res.transition_errors, res.passed);
+                if let Some(obj) = report.as_object_mut() {
+                    obj.insert("installed".into(), Value::Bool(res.installed));
+                    obj.insert(
+                        "note".into(),
+                        Value::String(
+                            "Agents cannot approve stops. If passed is false, report stop_reasons, route, residual_diffs, and approval subject to the user.".into(),
+                        ),
+                    );
                 }
-                let out = Command::new("npm")
-                    .current_dir(&tmp_dir)
-                    .args(["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", pkg])
-                    .output()
-                    .map_err(|e| format!("npm spawn error: {e}"))?;
-                if !out.status.success() {
-                    let _ = fs::remove_dir_all(&tmp_dir);
-                    return Err(format!("npm failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
-                }
-                let head_lock = fs::read(tmp_dir.join("package-lock.json"))
-                    .map_err(|e| format!("read resolved lock: {e}"))?;
-                let head_pkg = fs::read(tmp_dir.join("package.json"))
-                    .map_err(|e| format!("read resolved pkg: {e}"))?;
-                let _ = fs::remove_dir_all(&tmp_dir);
-
-                let (items, passed) = run_check_bytes(
-                    &base_lock,
-                    &head_lock,
-                    Some(&base_pkg),
-                    Some(&head_pkg),
-                    read,
-                    &as_of,
-                    no_osv,
-                    &self.store_root,
-                    &self.cfg,
-                    &[],
-                    &[],
-                )?;
-                Ok(json!({
-                    "passed": passed,
-                    "note": "Agents cannot approve stops. If passed is false, report stop_reasons and approval subjects to the user.",
-                    "transitions": items.iter().map(|i| json!({
-                        "name": i.ledger.name,
-                        "version": i.ledger.new.version,
-                        "subject": i.ledger.subject,
-                        "verdict": i.decision.verdict,
-                        "stop_rules": i.decision.stop_rules,
-                        "stop_reasons": i.decision.stop_reasons,
-                        "reading": i.reading,
-                    })).collect::<Vec<_>>()
-                }))
+                Ok(report)
             }
             other => Err(format!("unknown tool {other}")),
         }
@@ -1735,8 +1773,16 @@ fn base64_encode(input: &[u8]) -> String {
         let triple = (b0 << 16) | (b1 << 8) | b2;
         out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
         out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 { TABLE[((triple >> 6) & 0x3f) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[(triple & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TABLE[((triple >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(triple & 0x3f) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }

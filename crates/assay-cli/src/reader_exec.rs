@@ -1,20 +1,21 @@
 use assay_core::canonical::to_canonical_json;
 use assay_core::model::ReadingOutcome;
-use assay_core::packet::{ReadingPacket, reverse_packet_units};
+use assay_core::packet::ReadingPacket;
 use assay_core::reader::{
     READER_SYSTEM_PROMPT, ReadingRecord, instruction_hash, reader_output_json_schema,
     validate_reading_output,
 };
 use serde_json::{Value, json};
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct ReaderExecConfig {
     pub command: Option<String>,
     pub model: String,
     pub effort: String,
-    pub readings: u8,
     pub timeout_secs: u64,
 }
 
@@ -24,18 +25,27 @@ impl Default for ReaderExecConfig {
             command: None,
             model: "claude-opus-5-5".to_string(),
             effort: "high".to_string(),
-            readings: 1,
             timeout_secs: 90,
         }
     }
 }
 
-/// Runs one (or two, when `cfg.readings >= 2`) reading passes and returns the validated `ReadingRecord`.
+/// Runs the configured reader (built-in Anthropic or external subprocess).
+/// Splits large multi-unit packets into bounded batches so each request stays within token limits.
 pub fn run_reading(
     packet: &ReadingPacket,
     ledger_id: &str,
     cfg: &ReaderExecConfig,
 ) -> ReadingRecord {
+    if packet.units.is_empty() {
+        return make_status_record(
+            packet,
+            ledger_id,
+            &cfg.model,
+            ReadingOutcome::Invalid,
+            "reading packet contained zero units",
+        );
+    }
     if packet.units.iter().any(|u| u.unread) {
         return make_status_record(
             packet,
@@ -46,29 +56,95 @@ pub fn run_reading(
         );
     }
 
-    let first = run_single_pass(packet, ledger_id, cfg);
-    if cfg.readings < 2 || first.outcome != ReadingOutcome::Passed {
-        return first;
+    // Batch units so no single model call exceeds ~28 KiB of diff lines.
+    let batches = batch_packet_units(packet, 28_000);
+    if batches.len() == 1 {
+        return run_single_pass(packet, ledger_id, cfg);
     }
 
-    // Second independent pass with reversed unit order; both passes must pass.
-    match reverse_packet_units(packet) {
-        Ok(rev_pkt) => {
-            let second = run_single_pass(&rev_pkt, ledger_id, cfg);
-            if second.outcome == ReadingOutcome::Passed {
-                first
-            } else {
-                second
+    let mut all_findings = Vec::new();
+    let mut summaries = Vec::new();
+    let mut dropped_total = 0usize;
+    let mut total_units_read = 0usize;
+
+    for batch_pkt in batches {
+        let rec = run_single_pass(&batch_pkt, ledger_id, cfg);
+        match rec.outcome {
+            ReadingOutcome::Passed => {
+                total_units_read += rec.units_read;
+                if !rec.summary.is_empty() {
+                    summaries.push(rec.summary);
+                }
+            }
+            ReadingOutcome::Concern => {
+                total_units_read += rec.units_read;
+                all_findings.extend(rec.findings);
+                dropped_total += rec.dropped_findings;
+                if !rec.summary.is_empty() {
+                    summaries.push(rec.summary);
+                }
+            }
+            other => {
+                return ReadingRecord {
+                    packet_hash: packet.packet_hash.clone(),
+                    outcome: other,
+                    ..rec
+                };
             }
         }
-        Err(e) => make_status_record(
-            packet,
-            ledger_id,
-            &cfg.model,
-            ReadingOutcome::Invalid,
-            &format!("failed reversing packet for second pass: {e}"),
-        ),
     }
+
+    let combined_summary = summaries
+        .join(" ")
+        .chars()
+        .take(600)
+        .collect::<String>();
+    let outcome = if dropped_total > 0 {
+        ReadingOutcome::Invalid
+    } else if all_findings.is_empty() {
+        ReadingOutcome::Passed
+    } else {
+        ReadingOutcome::Concern
+    };
+
+    ReadingRecord {
+        kind: "reading".to_string(),
+        schema: 2,
+        ledger_id: ledger_id.to_string(),
+        packet_hash: packet.packet_hash.clone(),
+        model: cfg.model.clone(),
+        instruction_hash: instruction_hash(),
+        units_read: total_units_read,
+        findings: all_findings,
+        dropped_findings: dropped_total,
+        summary: combined_summary,
+        outcome,
+        error_detail: None,
+    }
+}
+
+fn batch_packet_units(packet: &ReadingPacket, max_bytes: usize) -> Vec<ReadingPacket> {
+    let mut batches = Vec::new();
+    let mut cur_units = Vec::new();
+    let mut cur_bytes = 0usize;
+
+    for u in &packet.units {
+        let u_bytes: usize = u.lines.iter().map(|l| l.len() + 1).sum();
+        if !cur_units.is_empty() && cur_bytes + u_bytes > max_bytes {
+            let mut p = packet.clone();
+            p.units = std::mem::take(&mut cur_units);
+            batches.push(p);
+            cur_bytes = 0;
+        }
+        cur_bytes += u_bytes;
+        cur_units.push(u.clone());
+    }
+    if !cur_units.is_empty() {
+        let mut p = packet.clone();
+        p.units = cur_units;
+        batches.push(p);
+    }
+    batches
 }
 
 fn run_single_pass(
@@ -187,7 +263,7 @@ fn run_builtin_anthropic_reader(
     let user_prompt = format_packet_prompt(packet);
     let body = json!({
         "model": cfg.model,
-        "max_tokens": 4096,
+        "max_tokens": 16384,
         "system": [
             {
                 "type": "text",
@@ -210,7 +286,27 @@ fn run_builtin_anthropic_reader(
         ]
     });
 
-    let mut child = match Command::new("curl")
+    // Write API key header to a 0600 temp curl config file (NEVER pass secret on argv where `ps` sees it!).
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let hdr_path = std::env::temp_dir().join(format!("assay-curl-hdr-{}-{nonce}", std::process::id()));
+    let hdr_content = format!(
+        "header = \"x-api-key: {}\"\nheader = \"anthropic-version: 2023-06-01\"\nheader = \"Content-Type: application/json\"\n",
+        api_key.trim().replace('"', "")
+    );
+    if let Err(e) = write_private_file(&hdr_path, hdr_content.as_bytes()) {
+        return make_status_record(
+            packet,
+            ledger_id,
+            &cfg.model,
+            ReadingOutcome::Unavailable,
+            &format!("failed creating private curl header config: {e}"),
+        );
+    }
+
+    let spawn_res = Command::new("curl")
         .args([
             "--silent",
             "--show-error",
@@ -220,12 +316,8 @@ fn run_builtin_anthropic_reader(
             &cfg.timeout_secs.to_string(),
             "-X",
             "POST",
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            "anthropic-version: 2023-06-01",
-            "-H",
-            &format!("x-api-key: {api_key}"),
+            "-K",
+            &hdr_path.display().to_string(),
             "--data-binary",
             "@-",
             "https://api.anthropic.com/v1/messages",
@@ -233,10 +325,12 @@ fn run_builtin_anthropic_reader(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-    {
+        .spawn();
+
+    let mut child = match spawn_res {
         Ok(c) => c,
         Err(e) => {
+            let _ = fs::remove_file(&hdr_path);
             return make_status_record(
                 packet,
                 ledger_id,
@@ -250,7 +344,10 @@ fn run_builtin_anthropic_reader(
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(body.to_string().as_bytes());
     }
-    let out = match child.wait_with_output() {
+    let out = child.wait_with_output();
+    let _ = fs::remove_file(&hdr_path);
+
+    let out = match out {
         Ok(o) => o,
         Err(e) => {
             return make_status_record(
@@ -286,7 +383,6 @@ fn run_builtin_anthropic_reader(
         );
     }
 
-    // SPEC 7.6: Always inspect stop_reason before reading content.
     let stop_reason = resp
         .get("stop_reason")
         .and_then(|v| v.as_str())
@@ -331,6 +427,23 @@ fn run_builtin_anthropic_reader(
     }
 }
 
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes)
+    }
+}
+
 fn format_packet_prompt(packet: &ReadingPacket) -> String {
     let mut s = String::new();
     s.push_str(&format!(
@@ -346,12 +459,10 @@ fn format_packet_prompt(packet: &ReadingPacket) -> String {
             s.push_str(&format!("- {sub}\n"));
         }
     }
-    if let Some(ref cl) = packet.stated_change.changelog_diff {
-        s.push_str("\nChangelog diff:\n");
-        s.push_str(cl);
-        s.push('\n');
-    }
-    if !packet.facts.breaks.is_empty() || !packet.facts.flags.is_empty() || !packet.facts.new_reach.is_empty() {
+    if !packet.facts.breaks.is_empty()
+        || !packet.facts.flags.is_empty()
+        || !packet.facts.new_reach.is_empty()
+    {
         s.push_str(&format!(
             "\nFacts: breaks={:?} flags={:?} new_reach={:?} new_hostnames={:?}\n",
             packet.facts.breaks,
@@ -384,12 +495,12 @@ fn make_status_record(
 ) -> ReadingRecord {
     ReadingRecord {
         kind: "reading".to_string(),
-        schema: 1,
+        schema: 2,
         ledger_id: ledger_id.to_string(),
         packet_hash: packet.packet_hash.clone(),
         model: model.to_string(),
         instruction_hash: instruction_hash(),
-        units: Vec::new(),
+        units_read: 0,
         findings: Vec::new(),
         dropped_findings: 0,
         summary: String::new(),
@@ -443,11 +554,10 @@ mod tests {
             packet_hash: "pkt1".into(),
         };
 
-        // Use python3 one-liner as a mock subprocess reader honouring stdin->stdout JSON contract
         let tmp = std::env::temp_dir().join(format!("assay-mock-reader-{}.py", std::process::id()));
-        std::fs::write(
+        fs::write(
             &tmp,
-            "import sys, json\np = json.load(sys.stdin)\nprint(json.dumps({'units':[{'unit_id':u['unit_id'],'fits_stated_change':'yes'} for u in p['units']],'findings':[],'summary':'Matches version bump.'}))\n",
+            "import sys, json\njson.load(sys.stdin)\nprint(json.dumps({'findings':[],'summary':'Matches version bump.'}))\n",
         )
         .unwrap();
 
@@ -455,13 +565,12 @@ mod tests {
             command: Some(format!("python3 {}", tmp.display())),
             model: "mock-reader".into(),
             effort: "low".into(),
-            readings: 2,
             timeout_secs: 10,
         };
 
         let rec = run_reading(&pkt, "ledger-xyz", &cfg);
         assert_eq!(rec.outcome, ReadingOutcome::Passed);
-        assert_eq!(rec.units.len(), 1);
-        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(rec.units_read, 1);
+        let _ = fs::remove_file(&tmp);
     }
 }

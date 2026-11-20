@@ -23,8 +23,7 @@ jobs:
        startsWith(github.event.comment.body, 'assay approve '))
     runs-on: ubuntu-latest
     env:
-      ASSAY_VERSION: "0.1.0"
-      # Pin the SHA-256 of the official release binary here before enabling in production:
+      ASSAY_RELEASE_URL: "https://github.com/REPLACE_ORG/assay/releases/download/v0.1.0/assay-x86_64-unknown-linux-gnu.tar.gz"
       ASSAY_SHA256: "REPLACE_WITH_RELEASE_SHA256"
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
@@ -33,7 +32,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve PR refs and comments
+      - name: Resolve PR refs and collaborator approval comments
         id: pr
         uses: actions/github-script@v7
         with:
@@ -77,39 +76,77 @@ jobs:
         run: |
           git fetch --no-tags origin "pull/${{ steps.pr.outputs.number }}/head:refs/assay/pr-head"
 
-      - name: Build or verify pinned Assay binary
+      - name: Install SHA-256 pinned Assay release binary
         run: |
-          # Option A (pinned release archive):
-          # curl -fsSL -o assay.tar.gz "https://github.com/<org>/assay/releases/download/v${ASSAY_VERSION}/assay-x86_64-unknown-linux-gnu.tar.gz"
-          # echo "${ASSAY_SHA256}  assay.tar.gz" | sha256sum -c -
-          # tar -xzf assay.tar.gz
-          # Option B (source build):
-          cargo build --release --locked
-          cp target/release/assay ./assay
+          if [ -n "${ASSAY_BIN:-}" ] && [ -x "${ASSAY_BIN}" ]; then
+            cp "${ASSAY_BIN}" ./assay
+            exit 0
+          fi
+          if [ "${ASSAY_SHA256}" = "REPLACE_WITH_RELEASE_SHA256" ]; then
+            echo "Set ASSAY_RELEASE_URL and ASSAY_SHA256 in .github/workflows/assay-pr.yml before enabling." >&2
+            exit 2
+          fi
+          curl -fsSL --proto '=https' -o /tmp/assay.tar.gz "${ASSAY_RELEASE_URL}"
+          echo "${ASSAY_SHA256}  /tmp/assay.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/assay.tar.gz -C /tmp
+          cp /tmp/assay ./assay
+          chmod +x ./assay
 
-      - name: Run Assay PR gate
+      - name: Run Assay PR gate (single evaluation)
         id: run
-        continue-on-error: true
         run: |
-          READ_FLAG=""
+          set +e
+          READ_ARGS=()
           if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-            READ_FLAG="--read"
+            READ_ARGS=(--read)
           fi
           ./assay pr \
             --base "${{ steps.pr.outputs.base }}" \
             --head "refs/assay/pr-head" \
             --comments-json /tmp/pr-comments.json \
             --pr-author "${{ steps.pr.outputs.author }}" \
-            $READ_FLAG > /tmp/assay-summary.md
+            "${READ_ARGS[@]}" > /tmp/assay-summary.md
           STATUS=$?
           ./assay pr \
             --base "${{ steps.pr.outputs.base }}" \
             --head "refs/assay/pr-head" \
             --comments-json /tmp/pr-comments.json \
             --pr-author "${{ steps.pr.outputs.author }}" \
-            $READ_FLAG --json > /tmp/assay-report.json || true
+            --json > /tmp/assay-report.json
           cat /tmp/assay-summary.md
-          exit $STATUS
+          echo "exit_code=${STATUS}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Post or update PR summary comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('/tmp/assay-summary.md', 'utf8');
+            const marker = '<!-- assay-pr-report -->';
+            const body = `${marker}\n\`\`\`text\n${summary.slice(0, 60000)}\n\`\`\``;
+            const prNum = Number('${{ steps.pr.outputs.number }}');
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNum,
+            });
+            const existing = comments.find(c => (c.body || '').includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNum,
+                body,
+              });
+            }
 
       - name: Upload Assay artifacts
         uses: actions/upload-artifact@v4
@@ -121,5 +158,5 @@ jobs:
             /tmp/assay-report.json
 
       - name: Fail check if unapproved stops remain
-        if: steps.run.outcome != 'success'
-        run: exit 1
+        if: steps.run.outputs.exit_code != '0'
+        run: exit "${{ steps.run.outputs.exit_code }}"

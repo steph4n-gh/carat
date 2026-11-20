@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Coding-agent PreToolUse hook for Bash tool calls.
-# Intercepts `npm install <pkg>` / `npm i <pkg>` / `npm add <pkg>` and runs
-# `assay add` before any package enters node_modules.
+# Redirects `npm install <pkg>` / `npm i <pkg>` / `npm add <pkg>` to Assay's
+# single-resolution installer (`assay add <pkg> --install`) or gates before install.
 #
+# Compatible with stock macOS /bin/bash 3.2 AND bash 5+.
 # Exit 0 = allow command
 # Exit 2 = block command (agent receives stderr with stop reasons & approval subject)
 set -euo pipefail
 
 PAYLOAD="$(cat)"
 
-# Extract tool_input.command and any package arguments from npm install/i/add.
 PARSED="$(python3 - "$PAYLOAD" <<'PY'
-import json, shlex, sys
+import json, re, shlex, sys
 
 raw = sys.argv[1]
 try:
@@ -27,9 +27,8 @@ cmd = (
 if not isinstance(cmd, str) or not cmd.strip():
     sys.exit(0)
 
-# Split simple shell chains (`&&`, `;`) and inspect each subcommand.
-import re
-segments = re.split(r'\s*(?:&&|\|\||;)\s*', cmd)
+# Split simple shell chains/newlines and inspect each segment.
+segments = re.split(r'(?:\s*(?:&&|\|\||;|\|)\s*|\n+)', cmd)
 pkgs = []
 for seg in segments:
     seg = seg.strip()
@@ -69,23 +68,35 @@ if [[ ! -x "$ASSAY_BIN" ]]; then
   exit 2
 fi
 
-EXTRA_ARGS=()
+GLOBAL_ARGS=()
 if [[ -n "${ASSAY_STORE_DIR:-}" ]]; then
-  EXTRA_ARGS+=(--store-dir "$ASSAY_STORE_DIR")
+  GLOBAL_ARGS+=(--store-dir "$ASSAY_STORE_DIR")
 fi
+
+SUB_ARGS=()
 if [[ "${ASSAY_READ:-0}" == "1" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
-  EXTRA_ARGS+=(--read)
+  SUB_ARGS+=(--read)
 fi
 
 while IFS= read -r PKG; do
   [[ -z "$PKG" ]] && continue
   echo "Assay pre-install gate checking ${PKG}..." >&2
-  if ! "$ASSAY_BIN" "${EXTRA_ARGS[@]}" add "$PKG" >&2; then
+  set +e
+  "$ASSAY_BIN" ${GLOBAL_ARGS[@]+"${GLOBAL_ARGS[@]}"} add "$PKG" ${SUB_ARGS[@]+"${SUB_ARGS[@]}"} >&2
+  RC=$?
+  set -e
+  if [[ "$RC" -eq 1 ]]; then
     echo "" >&2
     echo "BLOCKED by Assay: ${PKG} triggered an unapproved stop." >&2
-    echo "Do NOT bypass this gate or run 'assay approve'. Report the stop reasons and approval subject above to the user." >&2
+    echo "Do NOT bypass this gate or run 'assay approve'. Report the stop reasons, leftover diff, and approval subject above to the user." >&2
+    exit 2
+  elif [[ "$RC" -ne 0 ]]; then
+    echo "" >&2
+    echo "BLOCKED by Assay: operational error (exit ${RC}) while checking ${PKG}. Fix the error instead of installing blindly." >&2
     exit 2
   fi
 done <<< "$PARSED"
 
+# Even when the check passes, remind agents to prefer `assay add <pkg> --install`
+# so npm installs the exact checked lockfile via `npm ci --ignore-scripts` with zero re-resolution.
 exit 0

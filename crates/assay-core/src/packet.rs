@@ -1,7 +1,7 @@
 use crate::archive::{LoadedArchive, strip_archive_root};
 use crate::canonical::canonical_id;
 use crate::model::{
-    BreakKind, ClassTotal, FileRole, OriginClass, ReachToken, TransitionLedger,
+    BreakKind, ClassTotal, FileRole, OriginClass, ReachToken, ResidualDiff, TransitionLedger,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -198,6 +198,63 @@ pub fn build_reading_packet(
         }
     }
 
+    // If a reading was triggered by flags or new reach with ZERO unexplained executable files,
+    // include the changed non-carried executable/manifest files so the reader NEVER receives an empty packet!
+    if units.is_empty() && (!ledger.flags.is_empty() || !ledger.new_reach.is_empty()) {
+        for f in &ledger.files {
+            if f.class == OriginClass::Carried
+                || matches!(f.role, FileRole::Declaration | FileRole::SourceMap | FileRole::Doc)
+            {
+                continue;
+            }
+            let Some(new_bytes) = new_archive.contents.get(&f.path) else {
+                continue;
+            };
+            let Ok(new_text) = std::str::from_utf8(new_bytes) else {
+                continue;
+            };
+            let ref_text = ref_archive
+                .and_then(|r| r.contents.get(&f.path))
+                .and_then(|b| std::str::from_utf8(b).ok());
+            let (new_lines, new_split) = split_if_minified(new_text);
+            let raw_unit_lines: Vec<String> = match ref_text {
+                Some(rt) => {
+                    let (ref_lines, _) = split_if_minified(rt);
+                    unified_diff_lines(&ref_lines, &new_lines, 3)
+                }
+                None => new_lines.iter().map(|l| format!("+{l}")).collect(),
+            };
+            if raw_unit_lines.is_empty() {
+                continue;
+            }
+            let chunks = chunk_lines(
+                &raw_unit_lines,
+                budgets.per_call_budget_bytes,
+                budgets.overlap_lines,
+            );
+            let chunk_total = chunks.len().max(1);
+            for (idx, chunk) in chunks.into_iter().enumerate() {
+                let unit_id = if chunk_total == 1 {
+                    f.path.clone()
+                } else {
+                    format!("{}#{}/{}", f.path, idx + 1, chunk_total)
+                };
+                let line_count = chunk.len();
+                units.push(ReadingUnit {
+                    unit_id,
+                    path: f.path.clone(),
+                    is_new_file: ref_text.is_none(),
+                    is_minified_split: new_split,
+                    chunk_index: idx + 1,
+                    chunk_total,
+                    unread: false,
+                    line_count,
+                    lines: chunk,
+                });
+            }
+        }
+    }
+
     let mut packet = ReadingPacket {
         schema: 1,
         header: PacketHeader {
@@ -227,6 +284,67 @@ pub fn build_reading_packet(
 
     packet.packet_hash = canonical_id(&packet)?;
     Ok(packet)
+}
+
+/// Builds compact inline unified diff previews for unexplained executable/manifest files
+/// so reviewers and coding agents can immediately see the leftover lines without hunting tarballs.
+pub fn build_inline_residual_diffs(
+    ledger: &TransitionLedger,
+    ref_archive: Option<&LoadedArchive>,
+    new_archive: &LoadedArchive,
+    max_files: usize,
+    max_lines_per_file: usize,
+) -> Vec<ResidualDiff> {
+    let mut out = Vec::new();
+    for f in &ledger.files {
+        if out.len() >= max_files {
+            break;
+        }
+        if f.class != OriginClass::Unexplained
+            || matches!(f.role, FileRole::Declaration | FileRole::SourceMap | FileRole::Doc)
+        {
+            continue;
+        }
+        let Some(new_bytes) = new_archive.contents.get(&f.path) else {
+            continue;
+        };
+        let Ok(new_text) = std::str::from_utf8(new_bytes) else {
+            out.push(ResidualDiff {
+                path: f.path.clone(),
+                bytes: f.bytes,
+                total_lines: 0,
+                truncated: true,
+                diff: format!("[binary file, {} bytes]", f.bytes),
+            });
+            continue;
+        };
+        let ref_text = ref_archive
+            .and_then(|r| r.contents.get(&f.path))
+            .and_then(|b| std::str::from_utf8(b).ok());
+        let (new_lines, _) = split_if_minified(new_text);
+        let diff_lines = match ref_text {
+            Some(rt) => {
+                let (ref_lines, _) = split_if_minified(rt);
+                unified_diff_lines(&ref_lines, &new_lines, 2)
+            }
+            None => new_lines.iter().map(|l| format!("+{l}")).collect(),
+        };
+        let total_lines = diff_lines.len();
+        let truncated = total_lines > max_lines_per_file;
+        let shown: Vec<&str> = diff_lines
+            .iter()
+            .take(max_lines_per_file)
+            .map(|s| s.as_str())
+            .collect();
+        out.push(ResidualDiff {
+            path: f.path.clone(),
+            bytes: f.bytes,
+            total_lines,
+            truncated,
+            diff: shown.join("\n"),
+        });
+    }
+    out
 }
 
 /// Returns a copy of `packet` with units reversed (used for independent `readings = 2` verification).

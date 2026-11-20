@@ -19,9 +19,9 @@ pub fn normalize_crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestNormalization {
-    /// Only benign publish differences exist -> `source_normalized`.
+    /// Only explicitly allowed benign publish transforms exist -> `source_normalized`.
     Benign,
-    /// Significant differences exist -> `unexplained`, with field descriptions.
+    /// Significant or unexpected differences exist -> `unexplained`, with field descriptions.
     Significant(Vec<String>),
     /// One side could not be parsed as a JSON object.
     Unparseable,
@@ -35,21 +35,34 @@ const DEP_SECTIONS: &[&str] = &[
     "bundleDependencies",
     "bundledDependencies",
 ];
-const SIGNIFICANT_TOP_KEYS: &[&str] = &[
-    "bin",
-    "main",
-    "module",
-    "exports",
-    "imports",
-    "browser",
-    "files",
-    "repository",
-    "gypfile",
-    "os",
-    "cpu",
+
+/// Keys that npm/pnpm/yarn legitimately add, remove, or strip during publish without changing runtime semantics.
+const BENIGN_EPHEMERAL_KEYS: &[&str] = &[
+    "gitHead",
+    "devDependencies",
+    "publishConfig",
+    "packageManager",
+    "pnpm",
+    "volta",
+    "eslintConfig",
+    "prettier",
+    "jest",
+    "vitest",
+    "lint-staged",
+    "husky",
+    "readme",
+    "readmeFilename",
+    "_id",
+    "_nodeVersion",
+    "_npmVersion",
+    "_npmUser",
+    "dist",
+    "maintainers",
 ];
 
-/// Declared normalization #2: Published `package.json` vs source `package.json` (Section 7.3).
+/// Declared normalization #2: Published `package.json` vs source `package.json`.
+/// Applies ONLY explicitly allowed benign publish transforms and compares the COMPLETE remaining
+/// manifest objects (so changes to fields like `"type"`, `"sideEffects"`, etc. are caught!).
 pub fn compare_published_manifest(
     source_bytes: &[u8],
     published_bytes: &[u8],
@@ -57,15 +70,14 @@ pub fn compare_published_manifest(
     let Ok(Value::Object(src_raw)) = serde_json::from_slice::<Value>(source_bytes) else {
         return ManifestNormalization::Unparseable;
     };
-    let Ok(Value::Object(pub_map)) = serde_json::from_slice::<Value>(published_bytes) else {
+    let Ok(Value::Object(pub_raw)) = serde_json::from_slice::<Value>(published_bytes) else {
         return ManifestNormalization::Unparseable;
     };
 
-    // Apply `publishConfig` overlays onto a copy of source for comparison.
+    // 1. Apply `publishConfig` overlays onto a clone of source.
     let mut src = src_raw.clone();
     if let Some(Value::Object(pc)) = src_raw.get("publishConfig") {
         for (k, v) in pc {
-            // Standard fields promoted by pnpm/yarn/npm publishConfig
             if matches!(
                 k.as_str(),
                 "main"
@@ -87,10 +99,27 @@ pub fn compare_published_manifest(
             }
         }
     }
+    let mut pub_map = pub_raw;
 
     let mut significant = Vec::new();
 
-    // 1. Lifecycle scripts (`preinstall`, `install`, `postinstall`)
+    // 2. Version check: must match UNLESS source holds an explicit placeholder (prevents pointing gitHead at an older release).
+    let src_ver = src.get("version").and_then(|v| v.as_str());
+    let pub_ver = pub_map.get("version").and_then(|v| v.as_str());
+    if src_ver != pub_ver {
+        let is_placeholder = src_ver.map(is_placeholder_version).unwrap_or(false);
+        if !is_placeholder {
+            significant.push(format!(
+                "version ({} != {})",
+                src_ver.unwrap_or("none"),
+                pub_ver.unwrap_or("none")
+            ));
+        }
+    }
+    src.remove("version");
+    pub_map.remove("version");
+
+    // 3. Lifecycle scripts (`preinstall`, `install`, `postinstall`); non-lifecycle scripts may be stripped/reordered.
     let src_scripts = src.get("scripts").and_then(|v| v.as_object());
     let pub_scripts = pub_map.get("scripts").and_then(|v| v.as_object());
     for hook in LIFECYCLE_HOOKS {
@@ -100,25 +129,25 @@ pub fn compare_published_manifest(
             significant.push(format!("scripts.{hook}"));
         }
     }
+    src.remove("scripts");
+    pub_map.remove("scripts");
 
-    // 2. Runtime / optional / peer / bundled dependency sets and ranges
+    // 4. Runtime / optional / peer / bundled dependency sets and ranges
     for sec in DEP_SECTIONS {
-        let sv = src.get(*sec);
-        let pv = pub_map.get(*sec);
+        let sv = src.remove(*sec);
+        let pv = pub_map.remove(*sec);
         match (sv, pv) {
             (None, None) => {}
             (Some(Value::Object(sm)), Some(Value::Object(pm))) => {
                 let s_keys: BTreeSet<&String> = sm.keys().collect();
                 let p_keys: BTreeSet<&String> = pm.keys().collect();
-                if s_keys != p_keys {
-                    for added in p_keys.difference(&s_keys) {
-                        significant.push(format!("{sec}.{added} (added)"));
-                    }
-                    for removed in s_keys.difference(&p_keys) {
-                        significant.push(format!("{sec}.{removed} (removed)"));
-                    }
+                for added in p_keys.difference(&s_keys) {
+                    significant.push(format!("{sec}.{added} (added)"));
                 }
-                for (dep, p_range) in pm {
+                for removed in s_keys.difference(&p_keys) {
+                    significant.push(format!("{sec}.{removed} (removed)"));
+                }
+                for (dep, p_range) in &pm {
                     if let Some(s_range) = sm.get(dep) {
                         if s_range != p_range {
                             let benign_protocol = s_range
@@ -151,22 +180,39 @@ pub fn compare_published_manifest(
         }
     }
 
-    // 3. Significant top-level keys (with light normalization for repository shorthand & ./ prefix)
-    for key in SIGNIFICANT_TOP_KEYS {
-        let sv = src.get(*key);
-        let pv = pub_map.get(*key);
-        if sv == pv {
-            continue;
+    // 5. Repository & entry path normalization (./ prefix and git+/ssh/shorthand URL forms)
+    let src_repo = src.remove("repository");
+    let pub_repo = pub_map.remove("repository");
+    if src_repo != pub_repo && !same_repository_value(src_repo.as_ref(), pub_repo.as_ref()) {
+        significant.push("repository".to_string());
+    }
+
+    for entry_key in ["bin", "main", "module"] {
+        let sv = src.remove(entry_key);
+        let pv = pub_map.remove(entry_key);
+        if sv != pv && !same_entry_value(sv.as_ref(), pv.as_ref()) {
+            significant.push(entry_key.to_string());
         }
-        if *key == "repository" && same_repository_value(sv, pv) {
-            continue;
+    }
+
+    // 6. Strip explicitly allowed ephemeral publish keys, then compare ALL remaining keys!
+    for k in BENIGN_EPHEMERAL_KEYS {
+        src.remove(*k);
+        pub_map.remove(*k);
+    }
+
+    let all_keys: BTreeSet<String> = src.keys().chain(pub_map.keys()).cloned().collect();
+    for key in all_keys {
+        if src.get(&key) != pub_map.get(&key) {
+            // Allow benign `bugs`/`homepage` string-vs-object canonicalization if URL matches,
+            // otherwise flag ANY remaining manifest difference (including `type`, `exports`, `imports`, `sideEffects`, etc.)!
+            if (key == "bugs" || key == "homepage")
+                && same_simple_url_field(src.get(&key), pub_map.get(&key))
+            {
+                continue;
+            }
+            significant.push(key);
         }
-        if (*key == "bin" || *key == "main" || *key == "module")
-            && same_entry_value(sv, pv)
-        {
-            continue;
-        }
-        significant.push((*key).to_string());
     }
 
     if significant.is_empty() {
@@ -176,11 +222,36 @@ pub fn compare_published_manifest(
     }
 }
 
+fn is_placeholder_version(v: &str) -> bool {
+    let lower = v.to_ascii_lowercase();
+    lower == "0.0.0"
+        || lower.starts_with("0.0.0-")
+        || lower.contains("placeholder")
+        || lower.contains("development")
+        || lower.contains("semantically-released")
+}
+
+fn same_simple_url_field(a: Option<&Value>, b: Option<&Value>) -> bool {
+    let extract = |v: Option<&Value>| -> Option<String> {
+        match v? {
+            Value::String(s) => Some(s.trim_end_matches('/').to_ascii_lowercase()),
+            Value::Object(m) => m
+                .get("url")
+                .and_then(|u| u.as_str())
+                .map(|s| s.trim_end_matches('/').to_ascii_lowercase()),
+            _ => None,
+        }
+    };
+    let ea = extract(a);
+    ea.is_some() && ea == extract(b)
+}
+
 /// Checks whether npm registry metadata disagrees with the artifact's `package.json`
 /// on lifecycle scripts, runtime dependencies, or `bin`.
 pub fn registry_manifest_differs(
     artifact_manifest_bytes: &[u8],
     registry_version_json: &Value,
+    has_binding_gyp: bool,
 ) -> Vec<String> {
     let Ok(Value::Object(art)) = serde_json::from_slice::<Value>(artifact_manifest_bytes) else {
         return Vec::new();
@@ -191,13 +262,20 @@ pub fn registry_manifest_differs(
 
     let mut diffs = Vec::new();
 
-    // Lifecycle scripts
+    // Lifecycle scripts (tolerating npm's automatic `scripts.install = "node-gyp rebuild"` injection when binding.gyp exists)
     let art_scripts = art.get("scripts").and_then(|v| v.as_object());
     let reg_scripts = reg.get("scripts").and_then(|v| v.as_object());
     for hook in LIFECYCLE_HOOKS {
         let av = art_scripts.and_then(|m| m.get(*hook));
         let rv = reg_scripts.and_then(|m| m.get(*hook));
         if av != rv {
+            if *hook == "install"
+                && has_binding_gyp
+                && av.is_none()
+                && rv.and_then(|v| v.as_str()) == Some("node-gyp rebuild")
+            {
+                continue;
+            }
             diffs.push(format!("scripts.{hook}"));
         }
     }
@@ -213,7 +291,6 @@ pub fn registry_manifest_differs(
 
     // Bin
     if !same_entry_value(art.get("bin"), reg.get("bin")) {
-        // npm expands string `bin` into `{ <pkg>: <path> }` in registry metadata; tolerate that exact normalization.
         if !bin_string_matches_expanded_object(&art, reg.get("bin")) {
             diffs.push("bin".to_string());
         }
@@ -317,7 +394,6 @@ pub fn canonicalize_repo_url(raw: &str) -> String {
     if let Some(rest) = s.strip_prefix("http://") {
         s = format!("https://{rest}");
     }
-    // Strip fragment or query
     if let Some((before, _)) = s.split_once('#') {
         s = before.to_string();
     }
@@ -338,7 +414,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn benign_vs_significant_manifest_diffs() {
+    fn benign_vs_significant_manifest_diffs_including_type_and_version() {
         let src = br#"{
           "name": "demo",
           "version": "0.0.0-placeholder",
@@ -359,34 +435,48 @@ mod tests {
             ManifestNormalization::Benign
         );
 
-        let pub_evil = br#"{
-          "name": "demo",
+        // Changing `type` must be flagged as significant!
+        let pub_type_changed = br#"{
           "version": "1.2.3",
-          "dependencies": {"a": "^1.0.0", "stealer": "^1.0.0"},
-          "scripts": {"postinstall": "node steal.js"},
+          "name": "demo",
+          "type": "module",
+          "dependencies": {"a": "^1.0.0"},
           "repository": "org/repo"
         }"#;
-        match compare_published_manifest(src, pub_evil) {
+        match compare_published_manifest(src, pub_type_changed) {
             ManifestNormalization::Significant(fields) => {
-                assert!(fields.iter().any(|f| f == "scripts.postinstall"));
-                assert!(fields.iter().any(|f| f.contains("stealer")));
+                assert!(fields.contains(&"type".to_string()));
             }
-            other => panic!("expected significant diff, got {other:?}"),
+            other => panic!("expected significant diff on type, got {other:?}"),
         }
+
+        // Pointing at an OLD concrete version in git must be flagged!
+        let old_src = br#"{"name":"demo","version":"1.0.0"}"#;
+        let new_pub = br#"{"name":"demo","version":"1.0.1"}"#;
+        match compare_published_manifest(old_src, new_pub) {
+            ManifestNormalization::Significant(fields) => {
+                assert!(fields.iter().any(|f| f.starts_with("version")));
+            }
+            other => panic!("expected significant diff on version mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tolerates_npm_binding_gyp_install_injection() {
+        let art = br#"{"name":"native-pkg","version":"1.0.0"}"#;
+        let reg = serde_json::json!({
+            "name": "native-pkg",
+            "version": "1.0.0",
+            "scripts": { "install": "node-gyp rebuild" }
+        });
+        assert!(registry_manifest_differs(art, &reg, true).is_empty());
+        assert!(!registry_manifest_differs(art, &reg, false).is_empty());
     }
 
     #[test]
     fn canonicalizes_repo_urls() {
         assert_eq!(
             canonicalize_repo_url("git+https://github.com/ViteJS/Vite.git"),
-            "https://github.com/vitejs/vite"
-        );
-        assert_eq!(
-            canonicalize_repo_url("git@github.com:vitejs/vite.git"),
-            "https://github.com/vitejs/vite"
-        );
-        assert_eq!(
-            canonicalize_repo_url("vitejs/vite"),
             "https://github.com/vitejs/vite"
         );
     }

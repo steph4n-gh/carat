@@ -1,24 +1,22 @@
 use assay_core::lockfile::RouteEdge;
-use assay_core::model::{Decision, FileRole, OriginClass, TransitionLedger, Verdict};
+use assay_core::model::{Decision, FileRole, OriginClass, ResidualDiff, TransitionLedger, Verdict};
 use assay_core::reader::ReadingRecord;
 
 pub struct TransitionReportItem {
     pub ledger: TransitionLedger,
     pub decision: Decision,
     pub reading: Option<ReadingRecord>,
+    pub residual_diffs: Vec<ResidualDiff>,
     pub route: Vec<RouteEdge>,
     pub approved_by: Option<String>,
 }
 
-pub fn render_explain_markdown(
-    ledger: &TransitionLedger,
-    decision: &Decision,
-    reading: Option<&ReadingRecord>,
-    route: &[RouteEdge],
-    approved_by: Option<&str>,
-) -> String {
+pub fn render_explain_markdown(item: &TransitionReportItem) -> String {
+    let ledger = &item.ledger;
+    let decision = &item.decision;
     let mut out = String::new();
-    let badge = match (decision.verdict, approved_by) {
+
+    let badge = match (decision.verdict, item.approved_by.as_deref()) {
         (Verdict::Explained, _) => "OK  ",
         (Verdict::Read, _) => "READ",
         (Verdict::Stop, Some(_)) => "APPR",
@@ -30,10 +28,11 @@ pub fn render_explain_markdown(
         .as_ref()
         .map(|r| r.version.as_str())
         .unwrap_or("(new)");
-    let route_str = if route.is_empty() {
+    let route_str = if item.route.is_empty() {
         String::new()
     } else {
-        let chain = route
+        let chain = item
+            .route
             .iter()
             .map(|e| e.to.as_str())
             .collect::<Vec<_>>()
@@ -45,7 +44,7 @@ pub fn render_explain_markdown(
         ledger.name, ref_ver, ledger.new.version
     ));
 
-    if let Some(approver) = approved_by {
+    if let Some(ref approver) = item.approved_by {
         out.push_str(&format!("      approved by: {approver}\n"));
     }
 
@@ -77,6 +76,8 @@ pub fn render_explain_markdown(
             "      anchor: CONFLICT ({})\n",
             ledger.anchor.conflict_details.join(", ")
         ));
+    } else if let Some(ref err) = ledger.anchor.lookup_error {
+        out.push_str(&format!("      anchor: lookup failed ({err})\n"));
     } else {
         out.push_str(&format!(
             "      anchor: none (tried: {})\n",
@@ -97,7 +98,11 @@ pub fn render_explain_markdown(
         ));
     }
 
-    // Balance sheet table
+    if ledger.osv_unavailable {
+        out.push_str("      warning: OSV advisory lookup unavailable (check network)\n");
+    }
+
+    // Balance sheet summary
     let total_files: u64 = ledger.totals.values().map(|t| t.files).sum();
     let total_bytes: u64 = ledger.totals.values().map(|t| t.bytes).sum();
     let carried = ledger
@@ -113,27 +118,15 @@ pub fn render_explain_markdown(
         .cloned()
         .unwrap_or_default();
 
-    let explained_changed_bytes = changed_bytes.saturating_sub(unexplained.bytes);
-    let explained_pct = if changed_bytes == 0 {
-        100.0
-    } else {
-        (explained_changed_bytes as f64 / changed_bytes as f64) * 100.0
-    };
-
+    let accounted_files = total_files.saturating_sub(unexplained.files);
     out.push_str(&format!(
-        "      balance: {changed_files} changed file(s) ({}), {:.1}% explained",
+        "      balance: {accounted_files} of {total_files} files accounted for ({} carried, {} changed = {})",
+        carried.files,
+        changed_files,
         fmt_bytes(changed_bytes),
-        explained_pct
     ));
-    if carried.files > 0 {
-        out.push_str(&format!(
-            " | {} carried ({})",
-            carried.files,
-            fmt_bytes(carried.bytes)
-        ));
-    }
     if !ledger.removed_files.is_empty() {
-        out.push_str(&format!(" | {} removed", ledger.removed_files.len()));
+        out.push_str(&format!(", {} removed", ledger.removed_files.len()));
     }
     out.push('\n');
 
@@ -148,7 +141,7 @@ pub fn render_explain_markdown(
             if t.files > 0 {
                 let extra = if class == OriginClass::Unexplained {
                     format!(
-                        " (exec/other: {}, d.ts/map/doc: {})",
+                        " (code/manifest: {}, non-exec d.ts/map/doc: {})",
                         fmt_bytes(ledger.unexplained_code_bytes),
                         fmt_bytes(ledger.unexplained_non_exec_bytes)
                     )
@@ -166,46 +159,52 @@ pub fn render_explain_markdown(
         }
     }
 
-    let unexplained_exec: Vec<_> = ledger
-        .files
-        .iter()
-        .filter(|f| {
-            f.class == OriginClass::Unexplained
-                && !matches!(f.role, FileRole::Declaration | FileRole::SourceMap | FileRole::Doc)
-        })
-        .collect();
-    if !unexplained_exec.is_empty() {
-        out.push_str("      unexplained executable/manifest files:\n");
-        for f in unexplained_exec.iter().take(8) {
-            let diffs = if f.significant_manifest_diffs.is_empty() {
-                String::new()
-            } else {
-                format!(" [diffs: {}]", f.significant_manifest_diffs.join(", "))
-            };
-            out.push_str(&format!(
-                "        * {} ({}){}\n",
-                f.path,
-                fmt_bytes(f.bytes),
-                diffs
-            ));
+    // Inline residual diffs — the core 30-second wedge!
+    if !item.residual_diffs.is_empty() {
+        out.push_str("      leftover code diff(s) not matched to source:\n");
+        for rd in &item.residual_diffs {
+            out.push_str(&format!("        --- {} ({}) ---\n", rd.path, fmt_bytes(rd.bytes)));
+            for line in rd.diff.lines() {
+                out.push_str(&format!("        {line}\n"));
+            }
+            if rd.truncated {
+                out.push_str(&format!(
+                    "        ... ({} total diff lines; truncated for display)\n",
+                    rd.total_lines
+                ));
+            }
         }
-        if unexplained_exec.len() > 8 {
-            out.push_str(&format!(
-                "        * ... and {} more\n",
-                unexplained_exec.len() - 8
-            ));
+    } else {
+        let unexplained_exec: Vec<_> = ledger
+            .files
+            .iter()
+            .filter(|f| {
+                f.class == OriginClass::Unexplained
+                    && !matches!(f.role, FileRole::Declaration | FileRole::SourceMap | FileRole::Doc)
+            })
+            .collect();
+        if !unexplained_exec.is_empty() {
+            out.push_str("      unexplained executable/manifest files:\n");
+            for f in unexplained_exec.iter().take(6) {
+                let diffs = if f.significant_manifest_diffs.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [diffs: {}]", f.significant_manifest_diffs.join(", "))
+                };
+                out.push_str(&format!("        * {} ({}){}\n", f.path, fmt_bytes(f.bytes), diffs));
+            }
         }
     }
 
     if !ledger.breaks.is_empty() {
-        out.push_str("      breaks (stop):\n");
+        out.push_str("      breaks:\n");
         for b in &ledger.breaks {
             let note = ledger
                 .break_notes
                 .get(b)
                 .map(|s| format!(" — {s}"))
                 .unwrap_or_default();
-            out.push_str(&format!("        ! {b:?}{note}\n"));
+            out.push_str(&format!("        ! {}{note}\n", b.human_label()));
         }
     }
     if !ledger.flags.is_empty() {
@@ -216,7 +215,7 @@ pub fn render_explain_markdown(
                 .get(f)
                 .map(|s| format!(" — {s}"))
                 .unwrap_or_default();
-            out.push_str(&format!("        ~ {f:?}{note}\n"));
+            out.push_str(&format!("        ~ {}{note}\n", f.human_label()));
         }
     }
 
@@ -225,17 +224,14 @@ pub fn render_explain_markdown(
             .new_reach
             .iter()
             .map(|t| {
-                let mut s = format!("{t:?}");
-                if t.is_high() {
-                    s.push_str("[HIGH]");
-                }
+                let mut s = t.human_label().to_string();
                 if ledger.new_reach_in_unexplained.contains(t) {
-                    s.push_str("(unexplained)");
+                    s.push_str(" [in unexplained code]");
                 }
                 s
             })
             .collect();
-        out.push_str(&format!("      new reach: {}\n", toks.join(", ")));
+        out.push_str(&format!("      new capabilities: {}\n", toks.join("; ")));
     }
     if !ledger.new_hostnames.is_empty() {
         let hosts: Vec<&str> = ledger
@@ -247,9 +243,9 @@ pub fn render_explain_markdown(
         out.push_str(&format!("      new hostnames: {}\n", hosts.join(", ")));
     }
 
-    if let Some(r) = reading {
+    if let Some(ref r) = item.reading {
         out.push_str(&format!(
-            "      reading ({}): {:?}{}\n",
+            "      reader ({}): {:?}{}\n",
             r.model,
             r.outcome,
             if r.summary.is_empty() {
@@ -274,8 +270,8 @@ pub fn render_explain_markdown(
         }
     }
 
-    if !decision.stop_reasons.is_empty() && approved_by.is_none() {
-        out.push_str("      stop reasons:\n");
+    if !decision.stop_reasons.is_empty() && item.approved_by.is_none() {
+        out.push_str("      why stopped:\n");
         for r in &decision.stop_reasons {
             out.push_str(&format!("        - {r}\n"));
         }
@@ -296,12 +292,14 @@ pub fn render_explain_markdown(
 pub fn render_change_summary(
     items: &[TransitionReportItem],
     tampered_files: &[String],
+    transition_errors: &[String],
 ) -> String {
-    let total = items.len();
+    let total = items.len() + transition_errors.len();
     let unapproved_stops = items
         .iter()
         .filter(|i| i.decision.verdict == Verdict::Stop && i.approved_by.is_none())
-        .count();
+        .count()
+        + transition_errors.len();
     let explained_count = items
         .iter()
         .filter(|i| i.decision.verdict == Verdict::Explained)
@@ -314,43 +312,45 @@ pub fn render_change_summary(
     let mut out = String::new();
     if !tampered_files.is_empty() {
         out.push_str(&format!(
-            "STOP  protected Assay files modified in PR: {}\n\n",
+            "STOP  protected files modified or lockfile deleted: {}\n\n",
             tampered_files.join(", ")
         ));
+    }
+
+    for err in transition_errors {
+        out.push_str(&format!("STOP  cannot check transition: {err}\n"));
+    }
+    if !transition_errors.is_empty() {
+        out.push('\n');
     }
 
     out.push_str(&format!(
         "Assay: {unapproved_stops} of {total} changed package(s) need a person\n\n"
     ));
 
-    // Show stops first
     for item in items
         .iter()
         .filter(|i| i.decision.verdict == Verdict::Stop && i.approved_by.is_none())
     {
-        out.push_str(&render_explain_markdown(
-            &item.ledger,
-            &item.decision,
-            item.reading.as_ref(),
-            &item.route,
-            None,
-        ));
+        out.push_str(&render_explain_markdown(item));
         out.push('\n');
     }
 
-    // Show approved stops & reads concisely
     for item in items
         .iter()
         .filter(|i| i.decision.verdict == Verdict::Read || i.approved_by.is_some())
     {
         let label = if let Some(ref who) = item.approved_by {
-            format!("appr  {} -> {} (approved by {who})", item.ledger.name, item.ledger.new.version)
+            format!(
+                "appr  {} -> {} (approved by {who})",
+                item.ledger.name, item.ledger.new.version
+            )
         } else {
             let summary = item
                 .reading
                 .as_ref()
                 .map(|r| r.summary.as_str())
-                .unwrap_or("reading passed");
+                .unwrap_or("reader found no concerns");
             format!(
                 "read  {} {} -> {}  ({summary})",
                 item.ledger.name,
@@ -369,7 +369,7 @@ pub fn render_change_summary(
         out.push_str(&format!("ok    {explained_count} package(s) fully explained\n"));
     }
     if read_count > 0 && explained_count == 0 && unapproved_stops == 0 {
-        out.push_str(&format!("ok    {read_count} package(s) read and passed\n"));
+        out.push_str(&format!("ok    {read_count} package(s) read with no concerns\n"));
     }
     out
 }

@@ -19,7 +19,6 @@ pub struct Fetcher {
 #[derive(Debug, Clone)]
 pub struct RegistryPackageDoc {
     pub raw_bytes: Vec<u8>,
-    pub raw_sha256: String,
     pub json: Value,
 }
 
@@ -44,12 +43,10 @@ impl Fetcher {
         let encoded = encode_npm_name(name);
         let url = format!("https://registry.npmjs.org/{encoded}");
         let bytes = curl_get(&url, &[], true)?;
-        let raw_sha256 = sha256_hex(&bytes);
         let json: Value = serde_json::from_slice(&bytes)
             .map_err(|e| format!("failed to parse registry json for {name}: {e}"))?;
         Ok(RegistryPackageDoc {
             raw_bytes: bytes,
-            raw_sha256,
             json,
         })
     }
@@ -227,19 +224,19 @@ impl Fetcher {
         name: &str,
         version: &str,
         as_of_rfc3339: Option<&str>,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, bool) {
         let body = serde_json::json!({
             "package": { "name": name, "ecosystem": "npm" },
             "version": version
         });
         let Ok(resp) = curl_post_json("https://api.osv.dev/v1/query", &body.to_string()) else {
-            return Vec::new();
+            return (Vec::new(), true);
         };
         let Ok(val) = serde_json::from_slice::<Value>(&resp) else {
-            return Vec::new();
+            return (Vec::new(), true);
         };
         let Some(vulns) = val.get("vulns").and_then(|v| v.as_array()) else {
-            return Vec::new();
+            return (Vec::new(), false);
         };
 
         let cutoff = as_of_rfc3339.and_then(parse_rfc3339_unix);
@@ -248,7 +245,6 @@ impl Fetcher {
             let Some(id) = v.get("id").and_then(|x| x.as_str()) else {
                 continue;
             };
-            // Only treat MAL-* (OpenSSF Malicious Packages) advisories as `known_malicious` (not ordinary CVEs).
             let is_mal = id.starts_with("MAL-")
                 || v.get("aliases")
                     .and_then(|a| a.as_array())
@@ -274,7 +270,7 @@ impl Fetcher {
             ids.push(id.to_string());
         }
         ids.sort();
-        ids
+        (ids, false)
     }
 
     /// Resolves the anchor (provenance -> gitHead -> tag) and fetches a minimal
@@ -321,18 +317,27 @@ impl Fetcher {
         // 3. Tag by convention (if repo_url is HTTPS)
         let mut matched_tag_ref: Option<String> = None;
         let mut remote_heads: BTreeMap<String, String> = BTreeMap::new();
+        let mut remote_tags: BTreeSet<String> = BTreeSet::new();
+        let mut ls_remote_error: Option<String> = None;
         if let Some(ref url) = repo_url {
             if url.starts_with("https://") {
                 methods_tried.push("tag".to_string());
-                if let Ok(refs) = git_ls_remote(url) {
-                    for (refname, sha) in &refs {
-                        if refname.starts_with("refs/heads/") {
-                            remote_heads.insert(refname.clone(), sha.clone());
+                match git_ls_remote(url) {
+                    Ok(refs) => {
+                        for (refname, sha) in &refs {
+                            if refname.starts_with("refs/heads/") {
+                                remote_heads.insert(refname.clone(), sha.clone());
+                            } else if refname.starts_with("refs/tags/") {
+                                remote_tags.insert(sha.clone());
+                            }
+                        }
+                        if let Some((tag_ref, commit)) = find_matching_tag(name, version, &refs) {
+                            matched_tag_ref = Some(tag_ref);
+                            found_commits.push((AnchorMethod::Tag, commit));
                         }
                     }
-                    if let Some((tag_ref, commit)) = find_matching_tag(name, version, &refs) {
-                        matched_tag_ref = Some(tag_ref);
-                        found_commits.push((AnchorMethod::Tag, commit));
+                    Err(e) => {
+                        ls_remote_error = Some(e);
                     }
                 }
             }
@@ -340,9 +345,6 @@ impl Fetcher {
 
         // Check for conflicts between anchor methods.
         // Security ordering: Provenance > Tag (repo-backed) > GitHead (unsigned publisher metadata).
-        // Common release tools (`release-it`, `np`) publish before committing the version-bump tag,
-        // causing `gitHead` to lag `tag` by 1 commit. Prefer the stronger repo-backed anchor while
-        // recording the discrepancy; only hard-conflict when two repo-backed signals (Provenance vs Tag) disagree.
         let unique_commits: BTreeSet<String> = found_commits
             .iter()
             .map(|(_, c)| c.to_ascii_lowercase())
@@ -362,7 +364,6 @@ impl Fetcher {
 
             match (prov_commit, tag_commit) {
                 (Some((_, pc)), Some((_, tc))) if !pc.eq_ignore_ascii_case(tc) => {
-                    // Hard conflict: SLSA provenance and repository tag point to different commits.
                     return (
                         Anchor {
                             found: false,
@@ -376,6 +377,7 @@ impl Fetcher {
                             workflow_path: prov.as_ref().and_then(|p| p.workflow_path.clone()),
                             workflow_ref: prov.as_ref().and_then(|p| p.workflow_ref.clone()),
                             reachable_from_branch: None,
+                            lookup_error: None,
                         },
                         None,
                     );
@@ -402,6 +404,7 @@ impl Fetcher {
                     workflow_path: None,
                     workflow_ref: None,
                     reachable_from_branch: None,
+                    lookup_error: ls_remote_error,
                 },
                 None,
             );
@@ -421,31 +424,52 @@ impl Fetcher {
                     workflow_path: prov.as_ref().and_then(|p| p.workflow_path.clone()),
                     workflow_ref: prov.as_ref().and_then(|p| p.workflow_ref.clone()),
                     reachable_from_branch: None,
+                    lookup_error: None,
                 },
                 None,
             );
         };
 
-        // Determine branch reachability hint (exact match on a branch head or workflow ref on main/release).
+        // Branch/tag reachability check (prevents GitHub fork-PR commit spoofing via unsigned gitHead!):
+        // - Tag or Provenance or exact match on a remote branch/tag ref -> reachable = Some(true).
+        // - Unsigned GitHead not matching any branch head or tag -> check ancestry against default branch,
+        //   or mark reachable = Some(false) so `AnchorUnreachable` fires and prevents silent `explained`!
         let wf_ref = prov.as_ref().and_then(|p| p.workflow_ref.clone());
-        let reachable_hint = if remote_heads.values().any(|s| s.eq_ignore_ascii_case(&commit)) {
+        let directly_referenced = method == AnchorMethod::Tag
+            || matches!(method, AnchorMethod::ProvenanceAsserted | AnchorMethod::ProvenanceVerified)
+            || remote_heads.values().any(|s| s.eq_ignore_ascii_case(&commit))
+            || remote_tags.iter().any(|s| s.eq_ignore_ascii_case(&commit));
+
+        let fetch_ref = matched_tag_ref.as_deref();
+        let (snapshot, snapshot_err) = match self.fetch_git_source_snapshot(
+            url,
+            &commit,
+            fetch_ref,
+            name,
+            manifest.repository_directory.as_deref(),
+            archive,
+            non_carried_archive,
+        ) {
+            Ok(s) => (Some(s), None),
+            Err(e) => (None, Some(e)),
+        };
+
+        let reachable_from_branch = if directly_referenced {
             Some(true)
+        } else if snapshot.is_some() {
+            // For unsigned gitHead commits not directly pointed to by a branch/tag, verify ancestry against
+            // the default branch (main/master) with a bounded shallow check so fork-only commits get flagged!
+            let default_branch_sha = remote_heads
+                .get("refs/heads/main")
+                .or_else(|| remote_heads.get("refs/heads/master"))
+                .or_else(|| remote_heads.values().next());
+            match default_branch_sha {
+                Some(head_sha) => Some(self.is_commit_ancestor_of(url, &commit, head_sha)),
+                None => Some(false),
+            }
         } else {
             None
         };
-
-        let fetch_ref = matched_tag_ref.as_deref();
-        let snapshot = self
-            .fetch_git_source_snapshot(
-                url,
-                &commit,
-                fetch_ref,
-                name,
-                manifest.repository_directory.as_deref(),
-                archive,
-                non_carried_archive,
-            )
-            .ok();
 
         let pkg_dir = snapshot
             .as_ref()
@@ -463,10 +487,35 @@ impl Fetcher {
             repository_directory: pkg_dir,
             workflow_path: prov.as_ref().and_then(|p| p.workflow_path.clone()),
             workflow_ref: wf_ref,
-            reachable_from_branch: reachable_hint,
+            reachable_from_branch,
+            lookup_error: snapshot_err.or(ls_remote_error),
         };
 
         (anchor, snapshot)
+    }
+
+    fn is_commit_ancestor_of(&self, repo_url: &str, commit: &str, branch_head: &str) -> bool {
+        if commit.eq_ignore_ascii_case(branch_head) {
+            return true;
+        }
+        let repo_key = sha256_hex(repo_url.as_bytes());
+        let repo_dir = self.cache_dir.join("git").join(&repo_key[..24]);
+        if !repo_dir.exists() {
+            return false;
+        }
+        // Fetch bounded commit history (treeless/blobless, commit graph only) from default branch head.
+        let _ = run_git(
+            &repo_dir,
+            &[
+                "fetch",
+                "--no-tags",
+                "--filter=blob:none",
+                "--depth=200",
+                "origin",
+                branch_head,
+            ],
+        );
+        run_git(&repo_dir, &["merge-base", "--is-ancestor", commit, branch_head]).is_ok()
     }
 
     /// Best-effort fetch of commit subjects and a bounded unified source diff
@@ -748,12 +797,22 @@ impl Fetcher {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct HistoricalSlice {
+    pub prior_releases: Vec<ReleaseMetaSummary>,
+    pub total_prior_releases: usize,
+    pub first_published_at: Option<String>,
+    pub new_release: ReleaseMetaSummary,
+    /// SHA-256 of the canonical historical slice (timeless: unaffected by future publishes!).
+    pub slice_sha256: String,
+}
+
 /// Extracts historical prior releases strictly older than `new_version`'s publish time.
 pub fn build_release_history(
     doc: &Value,
     new_version: &str,
     history_depth: usize,
-) -> (Vec<ReleaseMetaSummary>, ReleaseMetaSummary) {
+) -> HistoricalSlice {
     let time_map = doc.get("time").and_then(|v| v.as_object());
     let versions_map = doc.get("versions").and_then(|v| v.as_object());
 
@@ -794,15 +853,34 @@ pub fn build_release_history(
     }
 
     dated_prior.sort_by_key(|(ts, _)| *ts);
-    let len = dated_prior.len();
-    let start = len.saturating_sub(history_depth);
-    let prior = dated_prior
+    let total_prior_releases = dated_prior.len();
+    let first_published_at = dated_prior
+        .first()
+        .and_then(|(_, s)| s.published_at.clone())
+        .or_else(|| new_summary.published_at.clone());
+    let start = total_prior_releases.saturating_sub(history_depth);
+    let prior: Vec<ReleaseMetaSummary> = dated_prior
         .into_iter()
         .skip(start)
         .map(|(_, s)| s)
         .collect();
 
-    (prior, new_summary)
+    let slice_obj = serde_json::json!({
+        "total_prior_releases": total_prior_releases,
+        "first_published_at": first_published_at,
+        "prior": prior,
+        "new": new_summary,
+    });
+    let slice_sha256 = assay_core::canonical::canonical_id(&slice_obj)
+        .unwrap_or_else(|_| sha256_hex(slice_obj.to_string().as_bytes()));
+
+    HistoricalSlice {
+        prior_releases: prior,
+        total_prior_releases,
+        first_published_at,
+        new_release: new_summary,
+        slice_sha256,
+    }
 }
 
 fn summarize_version(version: &str, v: &Value, published_at: Option<String>) -> ReleaseMetaSummary {

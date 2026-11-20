@@ -1,8 +1,12 @@
-use crate::model::{Anchor, ArtifactProfile, BreakKind, BreakSeverity, FileOrigin, FileRole, ManifestFacts, OriginClass};
+use crate::model::{
+    Anchor, ArtifactProfile, BreakKind, BreakSeverity, FileOrigin, FileRole, ManifestFacts,
+    OriginClass,
+};
 use crate::normalize::canonicalize_repo_url;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReleaseMetaSummary {
     pub version: String,
     pub published_at: Option<String>,
@@ -18,10 +22,13 @@ pub struct ReleaseMetaSummary {
 #[derive(Debug, Clone, Default)]
 pub struct HistoryContext {
     pub prior_releases: Vec<ReleaseMetaSummary>,
+    pub total_prior_releases: usize,
+    pub package_first_published_at: Option<String>,
     pub new_release: ReleaseMetaSummary,
     pub reference_had_anchor: Option<bool>,
     pub registry_manifest_diffs: Vec<String>,
     pub known_malicious_ids: Vec<String>,
+    pub osv_unavailable: bool,
     pub is_new_to_project: bool,
 }
 
@@ -56,7 +63,7 @@ pub fn evaluate_history(
     let mut res = HistoryResult::default();
     let prior = &ctx.prior_releases;
 
-    // 1. known_malicious (OSV)
+    // 1. known_malicious (OSV MAL-*)
     if !ctx.known_malicious_ids.is_empty() {
         res.record(
             BreakKind::KnownMalicious,
@@ -75,8 +82,8 @@ pub fn evaluate_history(
         );
     }
 
-    // 3. anchor_lost
-    if !new_anchor.found {
+    // 3. anchor_lost (ONLY if no network/git lookup error occurred!)
+    if !new_anchor.found && new_anchor.lookup_error.is_none() {
         let prior_had_anchor = ctx.reference_had_anchor.unwrap_or(false)
             || prior.iter().any(|r| r.has_provenance || r.has_git_head);
         if prior_had_anchor {
@@ -87,11 +94,11 @@ pub fn evaluate_history(
         }
     }
 
-    // 4. anchor_unreachable
+    // 4. anchor_unreachable (now genuinely populated by fetch ancestry check!)
     if new_anchor.found && new_anchor.reachable_from_branch == Some(false) {
         res.record(
             BreakKind::AnchorUnreachable,
-            "anchor commit is not reachable from the repository default or release branches",
+            "anchor commit is not reachable from a repository branch or tag",
         );
     }
 
@@ -99,10 +106,8 @@ pub fn evaluate_history(
     let prior_provenance_count = prior.iter().filter(|r| r.has_provenance).count();
     let prior_tp_count = prior.iter().filter(|r| r.has_trusted_publisher).count();
     let recent_window = prior.iter().rev().take(3).collect::<Vec<_>>();
-    let recent_had_prov = !recent_window.is_empty()
-        && recent_window.iter().all(|r| r.has_provenance);
-    let recent_had_tp = !recent_window.is_empty()
-        && recent_window.iter().all(|r| r.has_trusted_publisher);
+    let recent_had_prov = !recent_window.is_empty() && recent_window.iter().all(|r| r.has_provenance);
+    let recent_had_tp = !recent_window.is_empty() && recent_window.iter().all(|r| r.has_trusted_publisher);
 
     if (recent_had_prov || (prior.len() >= 3 && prior_provenance_count * 2 >= prior.len()))
         && !ctx.new_release.has_provenance
@@ -130,20 +135,19 @@ pub fn evaluate_history(
         .or(new_manifest.repository_url.as_deref())
         .map(canonicalize_repo_url);
     if let Some(ref nr) = new_repo {
-        let prior_repos: BTreeSet<String> = prior
+        let mut known_repos: BTreeSet<String> = prior
             .iter()
             .filter_map(|r| r.repository_url.as_deref().map(canonicalize_repo_url))
             .collect();
-        let ref_repo = ref_profile
+        if let Some(rr) = ref_profile
             .and_then(|p| {
                 p.anchor
                     .repository_url
                     .as_deref()
                     .or(p.manifest.repository_url.as_deref())
             })
-            .map(canonicalize_repo_url);
-        let mut known_repos = prior_repos;
-        if let Some(rr) = ref_repo {
+            .map(canonicalize_repo_url)
+        {
             known_repos.insert(rr);
         }
         if !known_repos.is_empty() && !known_repos.contains(nr) {
@@ -154,7 +158,7 @@ pub fn evaluate_history(
         }
     }
 
-    // 7. source_match_drop & unexplained_appeared (comparing against reference profile)
+    // 7. source_match_drop & unexplained_appeared (executable/manifest/binary files only)
     if let Some(rp) = ref_profile {
         let ref_source_paths: BTreeSet<&str> = rp
             .files
@@ -183,7 +187,7 @@ pub fn evaluate_history(
             res.record(
                 BreakKind::SourceMatchDrop,
                 format!(
-                    "{} file(s) matched source in reference and are now unexplained ({preview})",
+                    "{} executable file(s) matched source in reference and are now unexplained ({preview})",
                     dropped.len()
                 ),
             );
@@ -210,7 +214,7 @@ pub fn evaluate_history(
         if new_manifest.has_install_exec {
             res.record(
                 BreakKind::InstallScriptNew,
-                "package new to project defines install-time execution",
+                "package defines install-time execution",
             );
         }
     } else if let Some(rp) = ref_profile {
@@ -271,74 +275,5 @@ pub fn evaluate_history(
         }
     }
 
-    // 12. size_jump (flag): unpacked size or file count > 2.5x max of prior K (with reasonable floor).
-    if prior.len() >= 3 {
-        let max_prior_size = prior.iter().filter_map(|r| r.unpacked_size).max();
-        let max_prior_files = prior.iter().filter_map(|r| r.file_count).max();
-        let size_spike = match (max_prior_size, ctx.new_release.unpacked_size) {
-            (Some(max_s), Some(new_s)) if max_s > 0 => {
-                new_s > max_s.saturating_mul(5) / 2 && new_s.saturating_sub(max_s) > 100_000
-            }
-            _ => false,
-        };
-        let file_spike = match (max_prior_files, ctx.new_release.file_count) {
-            (Some(max_f), Some(new_f)) if max_f > 0 => {
-                new_f > max_f.saturating_mul(5) / 2 && new_f.saturating_sub(max_f) > 25
-            }
-            _ => false,
-        };
-        if size_spike || file_spike {
-            res.record(
-                BreakKind::SizeJump,
-                "unpacked size or file count jumped sharply above recent release band",
-            );
-        }
-    }
-
-    // 13. version_out_of_sequence (flag)
-    if let Some(rp) = ref_profile {
-        if is_version_jump_suspicious(&rp.version, &ctx.new_release.version) {
-            res.record(
-                BreakKind::VersionOutOfSequence,
-                format!(
-                    "version {} -> {} skipped unexpectedly on release line",
-                    rp.version, ctx.new_release.version
-                ),
-            );
-        }
-    }
-
     res
-}
-
-fn parse_simple_semver(v: &str) -> Option<(u64, u64, u64, bool)> {
-    let is_pre = v.contains('-');
-    let core = v.split(['-', '+']).next()?;
-    let mut parts = core.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((major, minor, patch, is_pre))
-}
-
-fn is_version_jump_suspicious(from: &str, to: &str) -> bool {
-    let (Some((ma1, mi1, pa1, _)), Some((ma2, mi2, pa2, _))) =
-        (parse_simple_semver(from), parse_simple_semver(to))
-    else {
-        return false;
-    };
-    // Huge single-step jumps like 1.2.3 -> 99.0.0 or 1.2.3 -> 1.2.999
-    if ma2 > ma1 + 5 {
-        return true;
-    }
-    if ma2 == ma1 && mi2 > mi1 + 20 {
-        return true;
-    }
-    if ma2 == ma1 && mi2 == mi1 && pa2 > pa1 + 50 {
-        return true;
-    }
-    false
 }

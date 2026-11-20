@@ -23,7 +23,7 @@ impl Default for ReaderConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssayConfig {
     pub policy: PolicyConfig,
-    pub readings: u8,
+    /// Only run the reader on already-stopped transitions when explicitly enabled (default: false).
     pub read_on_stop: bool,
     pub reader: ReaderConfig,
     pub stores: Vec<String>,
@@ -33,8 +33,7 @@ impl Default for AssayConfig {
     fn default() -> Self {
         Self {
             policy: PolicyConfig::default(),
-            readings: 1,
-            read_on_stop: true,
+            read_on_stop: false,
             reader: ReaderConfig::default(),
             stores: Vec::new(),
         }
@@ -48,7 +47,6 @@ struct RawAssayToml {
     settled_age: Option<String>,
     new_direct_dependency: Option<String>,
     read_pass: Option<String>,
-    readings: Option<u8>,
     read_on_stop: Option<bool>,
     history_depth: Option<usize>,
     stores: Option<Vec<String>>,
@@ -79,11 +77,12 @@ impl AssayConfig {
         }
         if let Some(s) = raw.new_direct_dependency {
             cfg.policy.new_direct_dependency = match s.as_str() {
+                "thin_history" => NewDirectPolicy::ThinHistory,
                 "confirm" => NewDirectPolicy::Confirm,
                 "check" => NewDirectPolicy::Check,
                 other => {
                     return Err(format!(
-                        "invalid new_direct_dependency '{other}': expected 'confirm' or 'check'"
+                        "invalid new_direct_dependency '{other}': expected 'thin_history', 'confirm', or 'check'"
                     ));
                 }
             };
@@ -98,12 +97,6 @@ impl AssayConfig {
                     ));
                 }
             };
-        }
-        if let Some(r) = raw.readings {
-            if r == 0 || r > 2 {
-                return Err(format!("invalid readings={r}: expected 1 or 2"));
-            }
-            cfg.readings = r;
         }
         if let Some(ros) = raw.read_on_stop {
             cfg.read_on_stop = ros;
@@ -167,10 +160,9 @@ mod tests {
         let toml_str = r#"
 min_age = "48h"
 settled_age = "14d"
-new_direct_dependency = "check"
+new_direct_dependency = "confirm"
 read_pass = "require_human"
-readings = 2
-read_on_stop = false
+read_on_stop = true
 history_depth = 15
 stores = ["/var/lib/assay-shared"]
 
@@ -182,10 +174,9 @@ timeout_secs = 120
         let cfg = AssayConfig::from_toml(toml_str).unwrap();
         assert_eq!(cfg.policy.min_age_hours, 48);
         assert_eq!(cfg.policy.settled_age_days, 14);
-        assert_eq!(cfg.policy.new_direct_dependency, NewDirectPolicy::Check);
+        assert_eq!(cfg.policy.new_direct_dependency, NewDirectPolicy::Confirm);
         assert_eq!(cfg.policy.read_pass, ReadPassPolicy::RequireHuman);
-        assert_eq!(cfg.readings, 2);
-        assert!(!cfg.read_on_stop);
+        assert!(cfg.read_on_stop);
         assert_eq!(cfg.policy.history_depth, 15);
         assert_eq!(cfg.reader.effort, "max");
         assert_eq!(cfg.stores, vec!["/var/lib/assay-shared"]);

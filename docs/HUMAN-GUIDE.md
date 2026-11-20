@@ -1,139 +1,158 @@
-# Assay Human Guide
+# Human Guide
 
-Assay gives you a **balance sheet** for npm dependency changes: for every package an update touches, it accounts for every changed byte against what you already had and what is in the public Git repository, checks whether the release broke the package's normal publishing habits, and only asks you (or the AI reader) to look at what is left over.
+This guide covers day-to-day workflows for engineers using Carat locally and in code review.
 
 ---
 
-## 1. Install
+## Read a Carat report
 
-Requires Rust (`cargo`), `git`, and `curl`.
+Every transition ends in one of three verdicts:
+
+| Label | JSON verdict | Meaning | Exit code |
+| --- | --- | --- | --- |
+| `EXPLAINED` | `explained` | Every changed executable byte matches prior bytes or public Git source, with no breaks, no new reach, and no flags. | `0` |
+| `READ` | `read` | Unexplained code diffs or flags were reviewed by the configured reader with zero findings, and no deterministic stop fired. | `0` |
+| `STOP` | `stop` | One or more stop rules (`S1`–`S10`) fired. Requires human inspection and approval (or rejection). | `1` |
+
+When Carat prints `STOP`, read the output top to bottom:
+
+1. **Route (`via root -> ... -> pkg`):** Shows which direct dependency pulled the package in.
+2. **Anchor:** Shows how Carat linked the tarball to public Git (`provenance`, `tag`, `gitHead`, or `none`).
+3. **Balance:** Shows how many changed files matched prior bytes (`Carried`), matched Git source (`Source`, `SourceNormalized`), or remain `Unexplained`.
+4. **Leftover code diffs:** Inline unified diffs of the unexplained executable or manifest files.
+5. **Breaks, new reach, and why stopped:** The exact deterministic facts that triggered the stop.
+6. **Approval line:** `carat approve <16-hex-ledger-id>`.
+
+An `EXPLAINED` verdict means the published bytes match prior bytes or public Git source with no detected breaks or new reach. It does not guarantee the upstream repository itself is bug-free.
+
+---
+
+## Add or update a package locally
+
+Use `carat add` instead of `npm install`:
 
 ```bash
-git clone <repo-url> assay
-cd assay
-./scripts/install.sh
+carat add zod@4.6.7 --install
 ```
 
-This builds the single optimized binary (~3.3 MB) and installs it to `~/.local/bin/assay`. Verify:
+To inspect what a package would pull in without modifying `package.json`, `package-lock.json`, or `node_modules`:
 
 ```bash
-assay --version
+carat add zod@4.6.7
 ```
 
-Optional: if you want Assay's built-in reader to inspect unexplained built diffs (like `dist/*.js`), export your Anthropic key:
+If `ANTHROPIC_API_KEY` is set and you want the built-in reader to inspect unexplained code diffs automatically, pass `--read`:
+
+```bash
+carat add zod@4.6.7 --read --install
+```
+
+`carat add` rejects CLI flags, URLs, `file:`, `git+`, and `npm:` specifiers, refuses repositories with `npm-shrinkwrap.json` or workspaces (use `carat check` for workspaces), and rolls back `package.json` and `package-lock.json` if `npm ci --ignore-scripts` fails.
+
+---
+
+## Check a lockfile diff
+
+Compare any two `package-lock.json` v3 files directly:
+
+```bash
+carat check \
+  --base old-package-lock.json \
+  --head package-lock.json \
+  --base-pkg old-package.json \
+  --head-pkg package.json
+```
+
+Supplying `--base-pkg` and `--head-pkg` enables direct-dependency detection (`S5`), accurate introducer routes, and manifest-lockfile desynchronization detection.
+
+---
+
+## Approve a stop
+
+### Local approvals
+
+After reviewing the leftover diff and stop reasons, approve the transition from an interactive terminal:
+
+```bash
+carat approve f0ea07e387524fb6 --note "Reviewed diff; repository moved from zeit/ms to vercel/ms"
+```
+
+How local approvals work:
+
+- `carat approve` accepts a unique 8–64 character lowercase hex prefix of either `ledger_id` or `subject`.
+- Approvals are stored in `.carat/approvals/<subject>.json` and bind to the exact set of `stop_facts` present at approval time.
+- **Rebases and upgrades:** Same `(ecosystem, name, old_sha512, new_sha512)` produces the same `subject`, so valid approvals survive rebases.
+- **Automatic staleness (`S10`):** If any new stop fact appears later (for example, a new `MAL-*` advisory, an anchor disappearing, or a stricter policy rule), `S10` fires and invalidates the old approval.
+- **Agent separation:** `carat approve` refuses non-TTY stdin unless `--non-interactive` is explicitly passed by a human script.
+
+### Pull request comment approvals
+
+In GitHub pull requests gated by `docs/workflows/carat-pr.yml`, a maintainer with repository write access (who is not the PR author) posts a standalone single-line comment with the exact `ledger_id` prefix printed in the PR report:
+
+```text
+carat approve f0ea07e387524fb6
+```
+
+- Multi-line comments, quoted blocks, and bot comments are ignored.
+- Binding to `ledger_id` automatically invalidates the comment if the lockfile integrity, anchor, breaks, new reach, or advisories change.
+- Known-malicious advisories (`MAL-*`) and reader `Concern` findings cannot be approved by PR comment alone.
+
+---
+
+## Use the optional LLM reader
+
+By default, Carat uses Anthropic's Messages API (`claude-opus-5-5`, `effort = "high"`) when `--read` is passed and `ANTHROPIC_API_KEY` is exported:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
+carat explain some-pkg@1.0.0..1.0.1 --read
+```
+
+To use a custom external reader executable, pass an explicit `--config` path or opt in via `CARAT_ALLOW_READER_COMMAND=1`:
+
+```bash
+carat --config ~/.config/carat/carat.toml explain some-pkg@1.0.0..1.0.1 --read
+```
+
+Carat refuses `reader.command` and external `stores` from auto-discovered working-directory `carat.toml` files so untrusted checkouts cannot execute arbitrary commands or inject approvals.
+
+---
+
+## Trace historical exposure (incident response)
+
+When a compromised package or tarball hash is disclosed, search both your repository's Git history of `package-lock.json` (without checking out old commits) and your local `.carat/ledgers/` store:
+
+```bash
+carat exposure flatmap-stream@0.1.1 --repo .
+carat exposure --sha512 44e0... --repo .
+```
+
+The report prints the first commit date, last commit date, lockfile instance path, and whether the package is still present at `HEAD`.
+
+---
+
+## Audit standing lockfile debt
+
+List all packages in a lockfile that lack SHA-512 integrity hashes or use non-registry sources (`git+`, `file:`, `url`) without failing the build:
+
+```bash
+carat inventory --lock package-lock.json
 ```
 
 ---
 
-## 2. Five-Minute Tour
+## Replay a ledger 100% offline
 
-### Inspect any npm update (no project needed)
-```bash
-assay explain chalk@6.0.0..6.0.1
-assay explain zod@4.6.6..4.6.7
-assay explain vite@8.3.7..8.3.8 --read
-```
-
-### Bootstrap Assay in your project
-```bash
-cd /path/to/your-js-project
-assay init --github --mcp
-```
-This creates:
-- `assay.toml` (policy defaults)
-- `.github/workflows/assay-pr.yml` (PR gate running strictly from your protected base branch)
-- Prints the exact MCP config JSON (with your installed binary path) for coding agents.
-
-### Check before installing a new dependency
-```bash
-assay add zod@4.6.7
-```
-Assay resolves the full transitive tree inside an isolated temp directory using `npm install --package-lock-only --ignore-scripts`—nothing runs and nothing in your repo changes until every transition passes. Pass `--install` to automatically install when everything passes.
-
-### Check a `package-lock.json` diff (lockfile v3)
-```bash
-assay check --base old/package-lock.json --head new/package-lock.json
-```
-
----
-
-## 3. Reading a Balance Sheet
-
-Every changed package gets one of three verdicts:
-
-| Badge | Verdict | What it means | Action |
-| --- | --- | --- | --- |
-| `OK` | `explained` | Every changed byte matched prior bytes or public Git source (with declared normalizations only), no breaks, no flags, no new capabilities | None |
-| `READ` | `read` | Some unexplained bytes, flags, or ordinary new reach existed; the reader verified them against the stated change and found no concern | None (unless `read_pass = "require_human"`) |
-| `STOP` | `stop` | A hard stop rule fired | Review and either reject or run `assay approve <subject>` |
-| `APPR` | `stop` (approved) | Previously stopped, and a valid human approval covers these exact bytes and stop reasons | None |
-
-### Origin Classes (where each file's bytes came from)
-- **`Carried`**: byte-for-byte identical to the previous version you already had (even if moved).
-- **`Source`**: SHA-256 identical to the file at the corresponding path in the anchored Git commit.
-- **`SourceElsewhere`**: SHA-256 identical to a file elsewhere in the anchored Git commit (e.g. a monorepo root `LICENSE`).
-- **`SourceNormalized`**: identical after one of two explicit normalizations: `CRLF → LF`, or benign `package.json` publish changes (version placeholder replaced, `workspace:`/`catalog:` resolved, `devDependencies` stripped, `publishConfig` applied). Any change to lifecycle scripts, runtime dependencies, `bin`, `main`, `exports`, etc. stays **`Unexplained`**.
-- **`Unexplained`**: everything else (typically compiled `dist/` bundles—or injected code). Non-executable `.d.ts`, `.map`, and docs are reported separately so they don't bloat the reading budget.
-
----
-
-## 4. What the Stop Rules (`S1`–`S10`) Mean
-
-| Rule | Why it stopped |
-| --- | --- |
-| `S1` | Missing SHA-512 integrity in lockfile, or downloaded tarball bytes did not match it |
-| `S2` | Lockfile alarm: same version with changed bytes, registry host changed, or source switched to git/URL/file |
-| `S3` | Suspicious archive structure: path traversal (`..`), symlinks/hardlinks, duplicate/case-colliding paths, special entries, or size/entry limit exceeded |
-| `S4` | A hard publishing-habit break fired: `anchor_lost`, `provenance_lost`, `repo_changed`, `source_match_drop`, `install_script_new`, `install_script_changed`, `native_or_binary_new`, `registry_manifest_differs`, `known_malicious` (OSV `MAL-*`), or `tag_moved` |
-| `S5` | Brand-new direct dependency added to `package.json` (`new_direct_dependency = "confirm"` default) |
-| `S6` | Unexplained bytes with no Git source anchor (relaxed only for releases older than `settled_age`, default 30d) |
-| `S7` | New high-risk capability (`proc`, `dyn_code`, `native`, `install_exec`, `encoded_blob`, `shell_literal`, `minified_new`) OR any new capability (`net`, `fs`, `env`, etc.) located inside unexplained bytes |
-| `S8` | A reading was required and wasn't run (`--read` omitted), found a concern, was invalid, unread (over hard cap), refused, or unavailable |
-| `S9` | Release is fresh (`< min_age`, default 24h) and not 100% deterministically `explained` |
-| `S10` | An approval existed for these bytes, but **new stop reasons** appeared since it was approved |
-
----
-
-## 5. Approving a Stop
-
-Approvals are bound to the **subject** (the SHA-256 of `(ecosystem, name, old_sha512, new_sha512)`) and the exact set of stop rules you saw:
+Save an offline input bundle during `explain`:
 
 ```bash
-assay approve 7ac2cded06cdc20a --note "Reviewed diff, intentional direct dep"
+carat explain ms@2.1.2..2.1.3 --save-inputs
 ```
 
-- **Survives rebases and tool upgrades:** same old/new tarball bytes = same subject.
-- **Automatically goes stale (`S10`)** if a new stop reason appears later (for example, a new `MAL-*` advisory or a stricter rule).
-- **In GitHub PRs:** a maintainer with write access (who is *not* the PR author) posts a standalone single-line comment with the exact `ledger` ID prefix printed in the PR report:
-  ```
-  assay approve 7ac2cded06cdc20a
-  ```
-  Because PR comment approvals bind to the exact `ledger_id`, any change to lockfile integrity, anchors, breaks, or advisories invalidates the comment automatically. Known-malicious advisories (`MAL-*`) and reader `Concern` findings cannot be approved by PR comment alone.
-
----
-
-## 6. Incident Response & Offline Audits
-
-### "Were we exposed to package X?"
-Searches both your Git history of `package-lock.json` (without checking out old commits) and your `.assay/ledgers/` store:
+Recompute the exact `TransitionLedger` and `Decision` later with zero network access:
 
 ```bash
-assay exposure flatmap-stream@0.1.1 --repo .
-assay exposure --sha512 44e0... --repo .
+carat replay .carat/inputs/<ledger_id> --json
 ```
 
-### Offline deterministic replay
-Save an input bundle during a check and recompute it later with zero network access to verify byte-identical results:
-
-```bash
-assay explain chalk@6.0.0..6.0.1 --save-inputs
-assay replay .assay/inputs/<ledger-id>
-```
-
-### Standing lockfile inventory (never blocks)
-```bash
-assay inventory --lock package-lock.json
-```
+The JSON output includes `"byte_identical": true` when the recomputed `ledger_id` matches the recorded `expected_ledger_id`.

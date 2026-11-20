@@ -1,7 +1,7 @@
-use assay_core::canonical::to_canonical_json;
-use assay_core::model::ReadingOutcome;
-use assay_core::packet::ReadingPacket;
-use assay_core::reader::{
+use carat_core::canonical::to_canonical_json;
+use carat_core::model::ReadingOutcome;
+use carat_core::packet::ReadingPacket;
+use carat_core::reader::{
     READER_SYSTEM_PROMPT, ReadingRecord, instruction_hash, reader_output_json_schema,
     validate_reading_output,
 };
@@ -255,7 +255,7 @@ fn run_builtin_anthropic_reader(
             ledger_id,
             &cfg.model,
             ReadingOutcome::Unavailable,
-            "ANTHROPIC_API_KEY not set (set it or configure reader.command in assay.toml)",
+            "ANTHROPIC_API_KEY not set (set it or configure reader.command in carat.toml)",
         );
     };
     if api_key.trim().is_empty() {
@@ -299,7 +299,7 @@ fn run_builtin_anthropic_reader(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let hdr_path = std::env::temp_dir().join(format!("assay-curl-hdr-{}-{nonce}", std::process::id()));
+    let hdr_path = std::env::temp_dir().join(format!("carat-curl-hdr-{}-{nonce}", std::process::id()));
     let hdr_content = format!(
         "header = \"x-api-key: {}\"\nheader = \"anthropic-version: 2023-06-01\"\nheader = \"Content-Type: application/json\"\n",
         api_key.trim().replace('"', "")
@@ -522,7 +522,7 @@ fn make_status_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use assay_core::packet::{PacketFacts, PacketHeader, ReadingUnit, StatedChange, StepKind};
+    use carat_core::packet::{PacketFacts, PacketHeader, ReadingUnit, StatedChange, StepKind};
     use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
@@ -564,7 +564,7 @@ mod tests {
             packet_hash: "pkt1".into(),
         };
 
-        let tmp = std::env::temp_dir().join(format!("assay-mock-reader-{}.py", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("carat-mock-reader-{}.py", std::process::id()));
         fs::write(
             &tmp,
             "import sys, json\njson.load(sys.stdin)\nprint(json.dumps({'findings':[],'summary':'Matches version bump.'}))\n",

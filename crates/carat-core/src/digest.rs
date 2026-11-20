@@ -79,9 +79,9 @@ mod tests {
             git_blob_sha1_hex(b"hello\n"),
             "ce013625030ba8dba906f756967f9e9ca394464a"
         );
-        let sri = sha512_sri(b"assay");
+        let sri = sha512_sri(b"carat");
         let sri2 = sha512_sri(b"evil");
-        assert_eq!(parse_sha512_sri(&sri), Some(sha512_hex(b"assay")));
+        assert_eq!(parse_sha512_sri(&sri), Some(sha512_hex(b"carat")));
         assert_eq!(parse_sha512_sri(&format!("{sri} {sri2}")), None);
         assert_eq!(parse_sha512_sri(&format!("{sri} {sri}")), None);
         assert_eq!(parse_sha512_sri("sha256-AAAA"), None);

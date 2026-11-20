@@ -5,26 +5,26 @@ mod pr;
 mod reader_exec;
 mod render;
 
-use assay_core::archive::{LoadedArchive, extract_manifest_facts, inspect_tgz, strip_archive_root};
-use assay_core::canonical::{canonical_id, format_unix_rfc3339, to_canonical_json};
-use assay_core::config::AssayConfig;
-use assay_core::digest::{parse_sha512_sri, sha256_hex};
-use assay_core::history::HistoryContext;
-use assay_core::lockfile::{
+use carat_core::archive::{LoadedArchive, extract_manifest_facts, inspect_tgz, strip_archive_root};
+use carat_core::canonical::{canonical_id, format_unix_rfc3339, to_canonical_json};
+use carat_core::config::CaratConfig;
+use carat_core::digest::{parse_sha512_sri, sha256_hex};
+use carat_core::history::HistoryContext;
+use carat_core::lockfile::{
     LockTransition, deduplicate_transitions, diff_lockfiles, parent_node_modules_instance,
     parse_lockfile_packages,
 };
-use assay_core::model::{
+use carat_core::model::{
     ArchiveLimits, LockAlarm, ReadingOutcome, ReferenceStanding, StopRule, Verdict,
 };
-use assay_core::normalize::registry_manifest_differs;
-use assay_core::packet::{PacketBudgets, build_inline_residual_diffs, build_reading_packet};
-use assay_core::policy::{
+use carat_core::normalize::registry_manifest_differs;
+use carat_core::packet::{PacketBudgets, build_inline_residual_diffs, build_reading_packet};
+use carat_core::policy::{
     TransitionInput, build_artifact_profile, build_transition_ledger, evaluate_decision,
 };
-use assay_core::reader::{ReadingRecord, instruction_hash};
-use assay_core::source::SourceSnapshot;
-use assay_core::store::{
+use carat_core::reader::{ReadingRecord, instruction_hash};
+use carat_core::source::SourceSnapshot;
+use carat_core::store::{
     ApprovalRecord, InputBundle, RecordStore, reject_symlink, validate_safe_filename,
     write_atomic_no_symlink,
 };
@@ -46,21 +46,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_CONFIG_TOML: &str = include_str!("../../../assay.toml.example");
-const DEFAULT_GITHUB_WORKFLOW: &str = include_str!("../../../docs/workflows/assay-pr.yml");
+const DEFAULT_CONFIG_TOML: &str = include_str!("../../../carat.toml.example");
+const DEFAULT_GITHUB_WORKFLOW: &str = include_str!("../../../docs/workflows/carat-pr.yml");
 
 #[derive(Parser)]
-#[command(name = "assay", version, about = "A balance sheet for dependency changes")]
+#[command(name = "carat", version, about = "A balance sheet for dependency changes")]
 struct Cli {
     /// Emit machine-readable JSON output
     #[arg(long, global = true)]
     json: bool,
 
-    /// Store directory (default: .assay)
+    /// Store directory (default: .carat)
     #[arg(long, global = true)]
     store_dir: Option<PathBuf>,
 
-    /// Path to assay.toml configuration
+    /// Path to carat.toml configuration
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
@@ -83,7 +83,7 @@ enum Commands {
         /// Skip OSV advisory lookup (for zero-day backtesting only)
         #[arg(long)]
         no_osv: bool,
-        /// Save an offline input bundle under .assay/inputs/<ledger_id> for `assay replay`
+        /// Save an offline input bundle under .carat/inputs/<ledger_id> for `carat replay`
         #[arg(long)]
         save_inputs: bool,
     },
@@ -181,21 +181,21 @@ enum Commands {
 
     /// Recompute deterministic records 100% offline from a saved input bundle
     Replay {
-        /// Path to saved input bundle directory (e.g. .assay/inputs/<ledger_id>)
+        /// Path to saved input bundle directory (e.g. .carat/inputs/<ledger_id>)
         bundle: PathBuf,
         #[arg(long)]
         as_of: Option<String>,
     },
 
-    /// Run Assay's stdio JSON-RPC 2.0 MCP server for coding agents
+    /// Run Carat's stdio JSON-RPC 2.0 MCP server for coding agents
     Mcp,
 
-    /// Bootstrap Assay in a project (writes assay.toml, optional GitHub workflow, and MCP snippet)
+    /// Bootstrap Carat in a project (writes carat.toml, optional GitHub workflow, and MCP snippet)
     Init {
         /// Target project directory (default: current directory)
         #[arg(long, default_value = ".")]
         dir: PathBuf,
-        /// Also install .github/workflows/assay-pr.yml
+        /// Also install .github/workflows/carat-pr.yml
         #[arg(long)]
         github: bool,
         /// Print ready-to-paste MCP server JSON config for coding agents
@@ -209,11 +209,11 @@ enum Commands {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let store_root = cli.store_dir.unwrap_or_else(|| PathBuf::from(".assay"));
+    let store_root = cli.store_dir.unwrap_or_else(|| PathBuf::from(".carat"));
     let cfg = match load_config(cli.config.as_deref()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("assay config error: {e}");
+            eprintln!("carat config error: {e}");
             return ExitCode::from(2);
         }
     };
@@ -228,7 +228,7 @@ fn main() -> ExitCode {
         } => match run_explain(&spec, read, as_of, no_osv, save_inputs, &store_root, &cfg, cli.json) {
             Ok(passed) => if passed { ExitCode::from(0) } else { ExitCode::from(1) },
             Err(e) => {
-                eprintln!("assay error: {e}");
+                eprintln!("carat error: {e}");
                 ExitCode::from(2)
             }
         },
@@ -252,7 +252,7 @@ fn main() -> ExitCode {
         ) {
             Ok(passed) => if passed { ExitCode::from(0) } else { ExitCode::from(1) },
             Err(e) => {
-                eprintln!("assay error: {e}");
+                eprintln!("carat error: {e}");
                 ExitCode::from(2)
             }
         },
@@ -281,7 +281,7 @@ fn main() -> ExitCode {
         ) {
             Ok(passed) => if passed { ExitCode::from(0) } else { ExitCode::from(1) },
             Err(e) => {
-                eprintln!("assay error: {e}");
+                eprintln!("carat error: {e}");
                 ExitCode::from(2)
             }
         },
@@ -299,7 +299,7 @@ fn main() -> ExitCode {
                     res.passed,
                     cli.json,
                 ) {
-                    eprintln!("assay error: {e}");
+                    eprintln!("carat error: {e}");
                     return ExitCode::from(2);
                 }
                 if res.installed && !cli.json {
@@ -312,7 +312,7 @@ fn main() -> ExitCode {
                 }
             }
             Err(e) => {
-                eprintln!("assay error: {e}");
+                eprintln!("carat error: {e}");
                 ExitCode::from(2)
             }
         },
@@ -324,7 +324,7 @@ fn main() -> ExitCode {
         } => match run_approve(&subject, by, note, non_interactive, &store_root, &cfg, cli.json) {
             Ok(()) => ExitCode::from(0),
             Err(e) => {
-                eprintln!("assay error: {e}");
+                eprintln!("carat error: {e}");
                 ExitCode::from(2)
             }
         },
@@ -343,21 +343,21 @@ fn main() -> ExitCode {
         ) {
             Ok(()) => ExitCode::from(0),
             Err(e) => {
-                eprintln!("assay error: {e}");
+                eprintln!("carat error: {e}");
                 ExitCode::from(2)
             }
         },
         Commands::Inventory { lock } => match run_inventory(&lock, cli.json) {
             Ok(()) => ExitCode::from(0),
             Err(e) => {
-                eprintln!("assay error: {e}");
+                eprintln!("carat error: {e}");
                 ExitCode::from(2)
             }
         },
         Commands::Replay { bundle, as_of } => match run_replay(&bundle, as_of, &cfg, cli.json) {
             Ok(passed) => if passed { ExitCode::from(0) } else { ExitCode::from(1) },
             Err(e) => {
-                eprintln!("assay error: {e}");
+                eprintln!("carat error: {e}");
                 ExitCode::from(2)
             }
         },
@@ -366,7 +366,7 @@ fn main() -> ExitCode {
             match run_mcp_server(&dispatcher) {
                 Ok(()) => ExitCode::from(0),
                 Err(e) => {
-                    eprintln!("assay mcp error: {e}");
+                    eprintln!("carat mcp error: {e}");
                     ExitCode::from(2)
                 }
             }
@@ -379,7 +379,7 @@ fn main() -> ExitCode {
         } => match run_init(&dir, github, mcp, force, cli.json) {
             Ok(()) => ExitCode::from(0),
             Err(e) => {
-                eprintln!("assay init error: {e}");
+                eprintln!("carat init error: {e}");
                 ExitCode::from(2)
             }
         },
@@ -387,27 +387,27 @@ fn main() -> ExitCode {
 }
 
 fn allow_untrusted_reader_command() -> bool {
-    std::env::var("ASSAY_ALLOW_READER_COMMAND")
+    std::env::var("CARAT_ALLOW_READER_COMMAND")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
-fn load_config(explicit: Option<&Path>) -> Result<AssayConfig, String> {
+fn load_config(explicit: Option<&Path>) -> Result<CaratConfig, String> {
     if let Some(p) = explicit {
         let s = fs::read_to_string(p)
             .map_err(|e| format!("failed reading config {}: {e}", p.display()))?;
-        return AssayConfig::from_toml(&s);
+        return CaratConfig::from_toml(&s);
     }
-    for candidate in ["assay.toml", ".assay.toml"] {
+    for candidate in ["carat.toml", ".carat.toml"] {
         let p = Path::new(candidate);
         if p.exists() {
             reject_symlink(p)?;
             let s = fs::read_to_string(p)
                 .map_err(|e| format!("failed reading {}: {e}", p.display()))?;
-            let cfg = AssayConfig::from_toml(&s)?;
+            let cfg = CaratConfig::from_toml(&s)?;
             if cfg.reader.command.is_some() && !allow_untrusted_reader_command() {
                 return Err(format!(
-                    "refusing reader.command from auto-discovered {} (pass --config {} explicitly or set ASSAY_ALLOW_READER_COMMAND=1)",
+                    "refusing reader.command from auto-discovered {} (pass --config {} explicitly or set CARAT_ALLOW_READER_COMMAND=1)",
                     p.display(),
                     p.display()
                 ));
@@ -422,10 +422,10 @@ fn load_config(explicit: Option<&Path>) -> Result<AssayConfig, String> {
             return Ok(cfg);
         }
     }
-    Ok(AssayConfig::default())
+    Ok(CaratConfig::default())
 }
 
-/// Strictly validates a package specifier passed to `assay add` before invoking `npm`.
+/// Strictly validates a package specifier passed to `carat add` before invoking `npm`.
 /// Prevents CLI flag injection (`--ignore-scripts=false`, `--registry=...`) and non-registry URL/path specs.
 fn validate_npm_package_spec(package: &str) -> Result<(), String> {
     if package.is_empty() || package.len() > 256 {
@@ -595,7 +595,7 @@ fn scrubbed_npm_command(dir: &Path) -> Command {
     cmd
 }
 
-fn open_store(store_root: &Path, cfg: &AssayConfig) -> Result<RecordStore, String> {
+fn open_store(store_root: &Path, cfg: &CaratConfig) -> Result<RecordStore, String> {
     let readonly = cfg.stores.iter().map(PathBuf::from).collect();
     RecordStore::open(store_root.to_path_buf(), readonly)
 }
@@ -640,7 +640,7 @@ struct EvalOptions<'a> {
 fn evaluate_single_transition(
     fetcher: &Fetcher,
     store: &RecordStore,
-    cfg: &AssayConfig,
+    cfg: &CaratConfig,
     name: &str,
     ref_ver_opt: Option<&str>,
     ref_tarball_opt: Option<(&str, Option<&str>)>,
@@ -991,7 +991,7 @@ fn evaluate_single_transition(
         }
     }
 
-    // Check granular approval in store (disabled during `assay pr` so working-tree `.assay/approvals` cannot forge PR approvals)
+    // Check granular approval in store (disabled during `carat pr` so working-tree `.carat/approvals` cannot forge PR approvals)
     // or PR comments bound strictly to exact `ledger_id` (enforcing S10 staleness across lock/break/advisory changes).
     let store_approval = if opts.allow_store_approvals {
         store.find_approval(&ledger.subject)
@@ -1049,7 +1049,7 @@ fn run_explain(
     no_osv: bool,
     save_inputs: bool,
     store_root: &Path,
-    cfg: &AssayConfig,
+    cfg: &CaratConfig,
     json_output: bool,
 ) -> Result<bool, String> {
     let (name, from_ver, to_ver) = parse_transition_spec(spec)?;
@@ -1105,14 +1105,14 @@ fn run_check_bytes(
     read: bool,
     as_of: &str,
     store_root: &Path,
-    cfg: &AssayConfig,
+    cfg: &CaratConfig,
     tampered_files: &[String],
     pr_approvals: &[pr::ParsedPrApproval],
     allow_store_approvals: bool,
 ) -> Result<(Vec<TransitionReportItem>, Vec<String>, bool), String> {
     let diff = diff_lockfiles(base_lock, head_lock, base_pkg, head_pkg)?;
     let head_pkgs = parse_lockfile_packages(head_lock)?;
-    let head_pkg_map: BTreeMap<&str, &assay_core::lockfile::LockPackage> = head_pkgs
+    let head_pkg_map: BTreeMap<&str, &carat_core::lockfile::LockPackage> = head_pkgs
         .iter()
         .map(|p| (p.instance_path.as_str(), p))
         .collect();
@@ -1195,7 +1195,7 @@ fn verify_bundled_in_ancestor(
     instance_path: &str,
     pkg_name: &str,
     expected_version: Option<&str>,
-    head_pkg_map: &BTreeMap<&str, &assay_core::lockfile::LockPackage>,
+    head_pkg_map: &BTreeMap<&str, &carat_core::lockfile::LockPackage>,
     archive_cache: &mut BTreeMap<String, LoadedArchive>,
 ) -> Result<bool, String> {
     let Some((bundle_root_path, rel_subpath)) = find_bundle_root_ancestor(instance_path, head_pkg_map) else {
@@ -1227,7 +1227,7 @@ fn verify_bundled_in_ancestor(
 
 fn find_bundle_root_ancestor(
     instance_path: &str,
-    head_pkg_map: &BTreeMap<&str, &assay_core::lockfile::LockPackage>,
+    head_pkg_map: &BTreeMap<&str, &carat_core::lockfile::LockPackage>,
 ) -> Option<(String, String)> {
     let mut cur = instance_path.to_string();
     while let Some(parent_path) = parent_node_modules_instance(&cur) {
@@ -1257,7 +1257,7 @@ fn archive_contains_bundled_package(
         return false;
     };
     let Ok(val) =
-        serde_json::from_slice::<Value>(assay_core::archive::strip_utf8_bom(bytes))
+        serde_json::from_slice::<Value>(carat_core::archive::strip_utf8_bom(bytes))
     else {
         return false;
     };
@@ -1281,7 +1281,7 @@ fn archive_contains_bundled_package(
 fn eval_lock_transition(
     fetcher: &Fetcher,
     store: &RecordStore,
-    cfg: &AssayConfig,
+    cfg: &CaratConfig,
     t: &LockTransition,
     read: bool,
     as_of: &str,
@@ -1335,7 +1335,7 @@ fn run_check_files(
     read: bool,
     as_of_opt: Option<String>,
     store_root: &Path,
-    cfg: &AssayConfig,
+    cfg: &CaratConfig,
     json_output: bool,
 ) -> Result<bool, String> {
     let base_lock = fs::read(base).map_err(|e| format!("read {}: {e}", base.display()))?;
@@ -1422,32 +1422,32 @@ fn run_pr(
 ) -> Result<bool, String> {
     let as_of = now_rfc3339();
     // Compute merge-base so un-rebased PRs are diffed cleanly against their fork point,
-    // while policy (`assay.toml`) ALWAYS comes strictly from the protected `base` tip (SPEC 8 & 10.3).
+    // while policy (`carat.toml`) ALWAYS comes strictly from the protected `base` tip (SPEC 8 & 10.3).
     let diff_base = git_merge_base(repo, base, head).unwrap_or_else(|_| base.to_string());
     let changed_paths = list_changed_paths(repo, &diff_base, head)?;
     let mut tampered = detect_protected_file_tampering(&changed_paths);
 
     // Policy MUST come strictly from protected base revision (SPEC 8 & 10.3).
-    let base_cfg = match read_git_file(repo, base, "assay.toml")?
-        .or(read_git_file(repo, base, ".assay.toml")?)
+    let base_cfg = match read_git_file(repo, base, "carat.toml")?
+        .or(read_git_file(repo, base, ".carat.toml")?)
     {
         Some(bytes) => {
             let s = String::from_utf8(bytes)
-                .map_err(|_| "base assay.toml is not valid UTF-8".to_string())?;
-            let cfg = AssayConfig::from_toml(&s)?;
+                .map_err(|_| "base carat.toml is not valid UTF-8".to_string())?;
+            let cfg = CaratConfig::from_toml(&s)?;
             if cfg.reader.command.is_some() && !allow_untrusted_reader_command() {
                 return Err(
-                    "refusing reader.command from repository assay.toml during `assay pr` (set ASSAY_ALLOW_READER_COMMAND=1 to opt in)".into(),
+                    "refusing reader.command from repository carat.toml during `carat pr` (set CARAT_ALLOW_READER_COMMAND=1 to opt in)".into(),
                 );
             }
             if !cfg.stores.is_empty() {
                 return Err(
-                    "refusing external `stores` from repository assay.toml during `assay pr`".into(),
+                    "refusing external `stores` from repository carat.toml during `carat pr`".into(),
                 );
             }
             cfg
         }
-        None => AssayConfig::default(),
+        None => CaratConfig::default(),
     };
 
     let pr_approvals = match (comments_json, pr_author) {
@@ -1504,7 +1504,7 @@ fn run_pr(
     let base_lock =
         base_lock_opt.unwrap_or_else(|| br#"{"lockfileVersion":3,"packages":{"":{}}}"#.to_vec());
 
-    // Never trust working-tree `.assay/approvals/` during `assay pr` (only verified PR comment approvals apply).
+    // Never trust working-tree `.carat/approvals/` during `carat pr` (only verified PR comment approvals apply).
     let (items, transition_errors, passed) = run_check_bytes(
         &base_lock,
         &head_lock,
@@ -1527,7 +1527,7 @@ fn package_json_has_dependencies(pkg_bytes: Option<&[u8]>) -> bool {
     let Some(bytes) = pkg_bytes else {
         return false;
     };
-    let Ok(val) = serde_json::from_slice::<Value>(assay_core::archive::strip_utf8_bom(bytes)) else {
+    let Ok(val) = serde_json::from_slice::<Value>(carat_core::archive::strip_utf8_bom(bytes)) else {
         return true;
     };
     for sec in ["dependencies", "devDependencies", "optionalDependencies"] {
@@ -1557,14 +1557,14 @@ fn execute_add(
     read: bool,
     install: bool,
     store_root: &Path,
-    cfg: &AssayConfig,
+    cfg: &CaratConfig,
 ) -> Result<AddResult, String> {
     validate_npm_package_spec(package)?;
     let as_of = now_rfc3339();
 
     if project_dir.join("npm-shrinkwrap.json").exists() {
         return Err(
-            "refusing to run `assay add` when npm-shrinkwrap.json exists (npm ci prioritizes shrinkwrap over package-lock.json)".into(),
+            "refusing to run `carat add` when npm-shrinkwrap.json exists (npm ci prioritizes shrinkwrap over package-lock.json)".into(),
         );
     }
 
@@ -1581,14 +1581,14 @@ fn execute_add(
     let base_pkg_bytes = if had_base_pkg {
         fs::read(&base_pkg_path).map_err(|e| format!("read package.json: {e}"))?
     } else {
-        br#"{"name":"assay-project","version":"0.0.0","private":true}"#.to_vec()
+        br#"{"name":"carat-project","version":"0.0.0","private":true}"#.to_vec()
     };
     if let Ok(pkg_val) =
-        serde_json::from_slice::<Value>(assay_core::archive::strip_utf8_bom(&base_pkg_bytes))
+        serde_json::from_slice::<Value>(carat_core::archive::strip_utf8_bom(&base_pkg_bytes))
     {
         if pkg_val.get("workspaces").is_some() {
             return Err(
-                "`assay add` does not yet support npm workspaces (use `assay check` on workspace lockfile diffs)".into(),
+                "`carat add` does not yet support npm workspaces (use `carat check` on workspace lockfile diffs)".into(),
             );
         }
     }
@@ -1602,10 +1602,10 @@ fn execute_add(
     let base_pkg_hash = sha256_hex(&base_pkg_bytes);
     let base_lock_hash = sha256_hex(&base_lock_bytes);
 
-    let tmp_guard = create_private_temp_dir("assay-add")?;
+    let tmp_guard = create_private_temp_dir("carat-add")?;
     let tmp_dir = &tmp_guard.0;
-    let empty_user_rc = tmp_dir.join(".assay-empty-user.npmrc");
-    let empty_global_rc = tmp_dir.join(".assay-empty-global.npmrc");
+    let empty_user_rc = tmp_dir.join(".carat-empty-user.npmrc");
+    let empty_global_rc = tmp_dir.join(".carat-empty-global.npmrc");
     fs::write(&empty_user_rc, b"").map_err(|e| format!("write temp user npmrc: {e}"))?;
     fs::write(&empty_global_rc, b"").map_err(|e| format!("write temp global npmrc: {e}"))?;
     let user_rc_arg = format!("--userconfig={}", empty_user_rc.display());
@@ -1665,19 +1665,19 @@ fn execute_add(
         reject_symlink(&base_lock_path)?;
         validate_project_npmrc(&npmrc_path)?;
         if project_dir.join("npm-shrinkwrap.json").exists() {
-            return Err("npm-shrinkwrap.json appeared during Assay check; refusing to install".into());
+            return Err("npm-shrinkwrap.json appeared during Carat check; refusing to install".into());
         }
         if had_base_pkg {
             let cur = fs::read(&base_pkg_path)
                 .map_err(|e| format!("re-read package.json before install: {e}"))?;
             if sha256_hex(&cur) != base_pkg_hash {
                 return Err(
-                    "package.json changed on disk during Assay check; refusing to overwrite".into(),
+                    "package.json changed on disk during Carat check; refusing to overwrite".into(),
                 );
             }
         } else if base_pkg_path.exists() {
             return Err(
-                "package.json appeared on disk during Assay check; refusing to overwrite".into(),
+                "package.json appeared on disk during Carat check; refusing to overwrite".into(),
             );
         }
         if had_base_lock {
@@ -1685,13 +1685,13 @@ fn execute_add(
                 .map_err(|e| format!("re-read package-lock.json before install: {e}"))?;
             if sha256_hex(&cur) != base_lock_hash {
                 return Err(
-                    "package-lock.json changed on disk during Assay check; refusing to overwrite"
+                    "package-lock.json changed on disk during Carat check; refusing to overwrite"
                         .into(),
                 );
             }
         } else if base_lock_path.exists() {
             return Err(
-                "package-lock.json appeared on disk during Assay check; refusing to overwrite"
+                "package-lock.json appeared on disk during Carat check; refusing to overwrite"
                     .into(),
             );
         }
@@ -1749,12 +1749,12 @@ fn run_approve(
     note: Option<String>,
     non_interactive: bool,
     store_root: &Path,
-    cfg: &AssayConfig,
+    cfg: &CaratConfig,
     json_output: bool,
 ) -> Result<(), String> {
     if !non_interactive && !std::io::stdin().is_terminal() {
         return Err(
-            "assay approve requires an interactive human terminal (refusing non-TTY agent call; humans scripting approvals may pass --non-interactive)".into(),
+            "carat approve requires an interactive human terminal (refusing non-TTY agent call; humans scripting approvals may pass --non-interactive)".into(),
         );
     }
 
@@ -1871,7 +1871,7 @@ fn run_inventory(lock: &Path, json_output: bool) -> Result<(), String> {
         .count();
     let non_registry = pkgs
         .iter()
-        .filter(|p| p.source_kind != assay_core::lockfile::SourceKind::Registry && !p.in_bundle)
+        .filter(|p| p.source_kind != carat_core::lockfile::SourceKind::Registry && !p.in_bundle)
         .count();
 
     if json_output {
@@ -1883,7 +1883,7 @@ fn run_inventory(lock: &Path, json_output: bool) -> Result<(), String> {
         });
         println!("{}", to_canonical_json(&out)?);
     } else {
-        println!("Assay inventory for {}", lock.display());
+        println!("Carat inventory for {}", lock.display());
         println!("  total package instances: {}", pkgs.len());
         println!("  missing SHA-512 integrity: {missing_integrity}");
         println!("  non-registry sources (git/url/file): {non_registry}");
@@ -1894,7 +1894,7 @@ fn run_inventory(lock: &Path, json_output: bool) -> Result<(), String> {
 fn run_replay(
     bundle_dir: &Path,
     as_of_opt: Option<String>,
-    cfg: &AssayConfig,
+    cfg: &CaratConfig,
     json_output: bool,
 ) -> Result<bool, String> {
     let bundle = RecordStore::load_input_bundle(bundle_dir)?;
@@ -2095,7 +2095,7 @@ fn run_init(
     let mut created: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
 
-    let cfg_path = dir.join("assay.toml");
+    let cfg_path = dir.join("carat.toml");
     if cfg_path.exists() && !force {
         skipped.push(cfg_path.display().to_string());
     } else {
@@ -2107,7 +2107,7 @@ fn run_init(
 
     if github {
         let wf_dir = dir.join(".github").join("workflows");
-        let wf_path = wf_dir.join("assay-pr.yml");
+        let wf_path = wf_dir.join("carat-pr.yml");
         if wf_path.exists() && !force {
             skipped.push(wf_path.display().to_string());
         } else {
@@ -2121,10 +2121,10 @@ fn run_init(
     let exe_path = std::env::current_exe()
         .ok()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "assay".to_string());
+        .unwrap_or_else(|| "carat".to_string());
     let mcp_config = json!({
         "mcpServers": {
-            "assay": {
+            "carat": {
                 "command": exe_path,
                 "args": ["mcp"],
                 "env": {
@@ -2161,7 +2161,7 @@ fn run_init(
 
 struct CliMcpDispatcher {
     store_root: PathBuf,
-    cfg: AssayConfig,
+    cfg: CaratConfig,
 }
 
 impl McpDispatcher for CliMcpDispatcher {
@@ -2175,7 +2175,7 @@ impl McpDispatcher for CliMcpDispatcher {
         let store = open_store(&self.store_root, &self.cfg)?;
 
         match name {
-            "assay_explain" => {
+            "carat_explain" => {
                 let spec = arguments
                     .get("spec")
                     .and_then(|v| v.as_str())
@@ -2214,7 +2214,7 @@ impl McpDispatcher for CliMcpDispatcher {
                     "reading": item.reading,
                 }))
             }
-            "assay_check" => {
+            "carat_check" => {
                 let base = PathBuf::from(
                     arguments
                         .get("base_lock")
@@ -2252,7 +2252,7 @@ impl McpDispatcher for CliMcpDispatcher {
                 )?;
                 Ok(change_report_json(&items, &[], &transition_errors, passed))
             }
-            "assay_add" => {
+            "carat_add" => {
                 let pkg = arguments
                     .get("package")
                     .and_then(|v| v.as_str())
@@ -2357,8 +2357,8 @@ mod tests {
 
     #[test]
     fn verifies_deep_transitive_bundled_packages_inside_bundle_root_and_rejects_forged() {
-        use assay_core::lockfile::{LockPackage, SourceKind};
-        use assay_core::model::ArchiveInventory;
+        use carat_core::lockfile::{LockPackage, SourceKind};
+        use carat_core::model::ArchiveInventory;
 
         let root_pkg = LockPackage {
             instance_path: "node_modules/npm".into(),

@@ -1,12 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/assay-core",
-    "crates/assay-cli",
+    "crates/carat-core",
+    "crates/carat-cli",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
-description = "A balance sheet for dependency changes"
+license = "MIT"
+repository = "https://github.com/steph4n-gh/carat"
+homepage = "https://github.com/steph4n-gh/carat"
+description = "A balance sheet for npm dependency changes"
+keywords = ["npm", "security", "supply-chain", "lockfile", "mcp"]
+categories = ["command-line-utilities", "development-tools"]

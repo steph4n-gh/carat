@@ -1,40 +1,44 @@
-# Assay Agent Guide
+# Agent Guide
 
-Assay is built to run natively alongside coding agents (Claude Code, Codex, Cursor, T3 Code, Windsurf, OpenCode) so agents can check npm packages before installing them—while keeping **humans** strictly in charge of approvals.
+Carat is designed to run natively alongside coding agents (Claude Code, Codex, Cursor, T3 Code, OpenCode, Windsurf) so agents verify npm packages before installing them while humans keep sole control over approvals.
 
-There are three ways to wire Assay into an agent, and you can combine them:
+Combine three integration layers:
 
-1. **MCP Server (`assay mcp`)** — native tool calls (`assay_explain`, `assay_check`, `assay_add`).
-2. **Pre-Install Shell Hook (`scripts/pre-install-hook.sh`)** — local guardrail that blocks raw `npm install`/`add`/`update` commands and redirects the agent to `assay add <pkg> --install --json` (real enforcement belongs in CI `assay pr` + `npm ci --ignore-scripts`).
-3. **Agent Skill (`skills/assay/SKILL.md` + `AGENTS.md`)** — teaches the agent when to run Assay, how to read JSON verdicts, and how to escalate stops cleanly.
+1. **MCP Server (`carat mcp`):** Native tool calls (`carat_explain`, `carat_check`, `carat_add`) with no approval tool exposed.
+2. **Pre-Install Shell Guardrail (`scripts/pre-install-hook.sh`):** Local `PreToolUse` Bash hook that blocks direct `npm install`, `npm add`, and `npm update` commands and redirects the agent to `carat add <pkg> --install --json`. (Hard enforcement belongs in CI `carat pr` + `npm ci --ignore-scripts`.)
+3. **Agent Skill and Instructions (`skills/carat/SKILL.md` and `AGENTS.md`):** Teaches the agent how to invoke Carat, read JSON verdicts, and escalate stops cleanly.
 
 ---
 
-## 1. Quick Setup (All Three in One Minute)
-
-First install the `assay` binary (and optionally install the skill into `~/.claude/skills/assay` and `~/.codex/skills/assay`):
+## 1. Install Carat and the agent skill
 
 ```bash
 ./scripts/install.sh --install-skill
 ```
 
-Print the ready-to-paste MCP configuration with your exact installed binary path:
+This installs:
 
-```bash
-assay init --mcp
-```
+- `~/.local/bin/carat`
+- `~/.claude/skills/carat/SKILL.md`
+- `~/.codex/skills/carat/SKILL.md`
 
 ---
 
-## 2. MCP Server (`assay mcp`)
+## 2. Configure the MCP server
 
-Add the printed block to your agent's MCP config (e.g. `.mcp.json`, `~/.claude.json`, Cursor MCP settings, or Codex MCP config):
+Print the ready-to-paste MCP server block with your resolved binary path:
+
+```bash
+carat init --mcp
+```
+
+Example configuration:
 
 ```json
 {
   "mcpServers": {
-    "assay": {
-      "command": "/Users/you/.local/bin/assay",
+    "carat": {
+      "command": "/Users/you/.local/bin/carat",
       "args": ["mcp"],
       "env": {
         "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}"
@@ -44,22 +48,21 @@ Add the printed block to your agent's MCP config (e.g. `.mcp.json`, `~/.claude.j
 }
 ```
 
-### Exposed MCP Tools
-| Tool | Inputs | What it does |
-| --- | --- | --- |
-| `assay_add` | `package` (required), `project_dir`, `read` | Resolves `<package>` in an isolated temp dir (`npm install --package-lock-only --ignore-scripts`), runs Assay on every new/changed transitive package, returns structured verdicts |
-| `assay_check` | `base_lock`, `head_lock` (required), `base_pkg`, `head_pkg`, `read` | Diffs two `package-lock.json` v3 files and checks every transition |
-| `assay_explain` | `spec` (`<name>@<from>..<to>`), `read`, `no_osv` | Explains a single npm version jump directly from the registry |
+### Exposed MCP tools
 
-**Security boundary:** `assay mcp` **never** exposes an approval tool. If `passed` is `false`, the agent must stop and present the stop reasons and approval subject to the user.
+| Tool | Required args | Optional args | Purpose |
+| --- | --- | --- | --- |
+| `carat_explain` | `spec` (`<name>@<from>..<to>`) | `read` (`bool`) | Inspect one npm version jump from the registry |
+| `carat_check` | `base_lock`, `head_lock` | `base_pkg`, `head_pkg`, `read` | Check a `package-lock.json` v3 diff |
+| `carat_add` | `package` | `project_dir`, `read`, `install` | Resolve once in temp, check every transition, and install exact lockfile via `npm ci --ignore-scripts` when `install: true` and `passed: true` |
+
+`carat mcp` deliberately omits any approval or config-mutation tool. Unknown tool names return a JSON-RPC error.
 
 ---
 
-## 3. Pre-Install Shell Hook (`PreToolUse`)
+## 3. Wire the pre-install Bash hook
 
-MCP gives the agent the ability to check packages; a `PreToolUse` hook **enforces** it on every shell `npm install` command.
-
-Copy or reference `scripts/pre-install-hook.sh` (already executable in this repo):
+In Claude Code (`~/.claude/settings.json` or `.claude/settings.json`):
 
 ```json
 {
@@ -70,7 +73,7 @@ Copy or reference `scripts/pre-install-hook.sh` (already executable in this repo
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/assay/scripts/pre-install-hook.sh"
+            "command": "/absolute/path/to/carat/scripts/pre-install-hook.sh"
           }
         ]
       }
@@ -79,67 +82,65 @@ Copy or reference `scripts/pre-install-hook.sh` (already executable in this repo
 }
 ```
 
-What the hook does:
-- Intercepts direct `npm install`, `npm i`, `npm add`, `npm update`, and aliases (including wrappers like `env npm ...` and flags before the subcommand).
-- Always blocks raw mutating `npm` installs (`exit 2`) and instructs the agent to run `assay add <pkg> --install --json` (or `assay check ... && npm ci --ignore-scripts`) instead—eliminating re-resolution TOCTOU and preventing lifecycle scripts from executing.
-- Reads the hook JSON payload strictly over stdin (never process argv) and fails closed (`exit 2`) if the payload cannot be parsed.
+How `scripts/pre-install-hook.sh` behaves:
+
+- Compatible with stock macOS `/bin/bash` 3.2 and bash 5+.
+- Reads the hook JSON payload strictly from stdin (never process `argv`) and fails closed (`exit 2`) if the payload cannot be parsed.
+- Intercepts direct `npm install`, `npm i`, `npm add`, `npm update`, and common npm install aliases—including leading `env`, `command`, `nohup`, `sudo`, environment assignments, and flags before the subcommand.
+- Always blocks mutating `npm` installs (`exit 2`) and tells the agent to run `carat add <pkg> --install --json` or `carat check ... && npm ci --ignore-scripts` instead.
+- Allows `npm ci`, `npm test`, `npm run ...`, and non-npm commands (`exit 0`).
 
 ---
 
-## 4. Machine JSON Contract
+## 4. Machine JSON contract
 
-All CLI commands support `--json` with deterministic, canonical JSON:
+All CLI commands support `--json` with canonical, deterministic JSON output.
 
-### `assay add <pkg> --json` / `assay check ... --json`
+### `carat add <pkg> --install --json` / `carat check ... --json`
+
 ```json
 {
+  "installed": false,
   "passed": false,
   "tampered_protected_files": [],
+  "transition_errors": [],
   "transitions": [
     {
       "approved_by": null,
       "decision": {
-        "age_band": "settled",
-        "as_of": "2026-11-19T23:30:00Z",
-        "ledger_id": "...",
-        "policy_version": 1,
-        "published_age_hours": 1296,
-        "reading_outcome": "not_required",
-        "reading_required": false,
-        "stop_reasons": ["S5: new direct dependency requires human confirmation"],
-        "stop_rules": ["S5"],
-        "subject": "7ac2cded06cdc20a...",
+        "age_band": "fresh",
+        "as_of": "2026-11-20T05:00:00Z",
+        "ledger_id": "f0ea07e387524fb6...",
+        "reading_outcome": "not_run",
+        "reading_required": true,
+        "stop_facts": ["break:anchor_lost", "reading:notrun"],
+        "stop_reasons": ["..."],
+        "stop_rules": ["S4", "S8"],
+        "subject": "4dbf5392e222bdab...",
         "verdict": "stop"
       },
-      "ledger": { "...": "full timeless balance sheet" },
-      "ledger_id": "...",
+      "ledger": {
+        "breaks": ["anchor_lost"],
+        "name": "ms",
+        "new": { "version": "2.1.3", "sha512": "..." },
+        "new_reach": [],
+        "reference": { "version": "2.1.2", "sha512": "..." },
+        "subject": "4dbf5392e222bdab...",
+        "unexplained_code_bytes": 3741
+      },
       "reading": null,
-      "route": [{ "from": "root", "kind": "prod", "to": "chalk" }]
+      "residual_diffs": [],
+      "route": [
+        { "from": "root", "kind": "prod", "to": "ms" }
+      ]
     }
   ]
 }
 ```
 
-### Agent Decision Loop
-1. If `passed == true` (exit `0`): proceed.
-2. If `passed == false` (exit `1`): **stop**. List every transition where `decision.verdict == "stop"` and `approved_by == null`, include `decision.stop_reasons` and `assay approve <decision.ledger_id[..16]>`, and ask the user whether to approve or abort.
-3. On exit `2`: report stderr verbatim and stop.
+### Decision loop for agents
 
----
-
-## 5. Custom / Local Reader Contract
-
-If you want to use a local model or a different provider instead of the built-in Anthropic reader, configure `reader.command` in `assay.toml`:
-
-```toml
-[reader]
-command = "/path/to/my-reader"
-model = "my-local-model"
-```
-
-Assay pipes a canonical `ReadingPacket` JSON to stdin and expects JSON on stdout matching [SPEC.md Appendix B](../SPEC.md):
-- `units`: `[{ "unit_id": "...", "fits_stated_change": "yes" | "no" | "cannot_tell" }]`
-- `findings`: `[{ "unit_id": "...", "start_line": 1, "end_line": 3, "excerpt": "verbatim text", "category": "...", "statement": "<=300 chars", "confidence": "low"|"medium"|"high" }]`
-- `summary`: `"<=600 chars"`
-
-The deterministic core verifies every finding's line range and verbatim excerpt before accepting it.
+1. Run `carat add <pkg> --install --json` (or call MCP `carat_add` with `install: true`).
+2. If `passed == true` (exit `0`), Carat has already written the checked lockfile and run `npm ci --ignore-scripts`. Report the exact Carat verdict (`explained` or `read`) and never claim the package is "safe."
+3. If `passed == false` (exit `1`), stop immediately. Report every transition where `decision.verdict == "stop"` and `approved_by == null`, include `route`, `decision.stop_reasons`, `ledger.breaks`, `ledger.new_reach`, `ledger.unexplained_code_bytes`, any `reading.findings`, and the human approval command `carat approve <decision.ledger_id[..16]>`.
+4. If exit `2` (or MCP `isError: true`), report the exact operational error and stop. Do not fall back to `npm install`.

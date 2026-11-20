@@ -1,9 +1,11 @@
 [package]
-name = "assay-core"
+name = "carat-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Deterministic core for Assay dependency balance sheets"
+repository.workspace = true
+homepage.workspace = true
+description = "Deterministic core for Carat dependency balance sheets"
 
 [dependencies]
 base64 = "0.22"

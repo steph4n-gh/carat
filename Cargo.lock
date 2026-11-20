@@ -59,30 +59,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "assay-cli"
-version = "0.1.0"
-dependencies = [
- "assay-core",
- "clap",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "assay-core"
-version = "0.1.0"
-dependencies = [
- "base64",
- "flate2",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "toml",
- "unicode-normalization",
-]
-
-[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -95,6 +71,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "carat-cli"
+version = "0.1.0"
+dependencies = [
+ "carat-core",
+ "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "carat-core"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "flate2",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "toml",
+ "unicode-normalization",
 ]
 
 [[package]]

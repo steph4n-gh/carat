@@ -21,7 +21,7 @@ impl Default for ReaderConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AssayConfig {
+pub struct CaratConfig {
     pub policy: PolicyConfig,
     /// Only run the reader on already-stopped transitions when explicitly enabled (default: false).
     pub read_on_stop: bool,
@@ -29,7 +29,7 @@ pub struct AssayConfig {
     pub stores: Vec<String>,
 }
 
-impl Default for AssayConfig {
+impl Default for CaratConfig {
     fn default() -> Self {
         Self {
             policy: PolicyConfig::default(),
@@ -42,7 +42,7 @@ impl Default for AssayConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawAssayToml {
+struct RawCaratToml {
     min_age: Option<String>,
     settled_age: Option<String>,
     new_direct_dependency: Option<String>,
@@ -62,10 +62,10 @@ struct RawReaderToml {
     timeout_secs: Option<u64>,
 }
 
-impl AssayConfig {
+impl CaratConfig {
     pub fn from_toml(input: &str) -> Result<Self, String> {
-        let raw: RawAssayToml =
-            toml::from_str(input).map_err(|e| format!("invalid assay.toml: {e}"))?;
+        let raw: RawCaratToml =
+            toml::from_str(input).map_err(|e| format!("invalid carat.toml: {e}"))?;
         let mut cfg = Self::default();
 
         if let Some(s) = raw.min_age {
@@ -156,7 +156,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_assay_toml_correctly() {
+    fn parses_carat_toml_correctly() {
         let toml_str = r#"
 min_age = "48h"
 settled_age = "14d"
@@ -164,14 +164,14 @@ new_direct_dependency = "confirm"
 read_pass = "require_human"
 read_on_stop = true
 history_depth = 15
-stores = ["/var/lib/assay-shared"]
+stores = ["/var/lib/carat-shared"]
 
 [reader]
 model = "claude-opus-5-5"
 effort = "max"
 timeout_secs = 120
 "#;
-        let cfg = AssayConfig::from_toml(toml_str).unwrap();
+        let cfg = CaratConfig::from_toml(toml_str).unwrap();
         assert_eq!(cfg.policy.min_age_hours, 48);
         assert_eq!(cfg.policy.settled_age_days, 14);
         assert_eq!(cfg.policy.new_direct_dependency, NewDirectPolicy::Confirm);
@@ -179,6 +179,6 @@ timeout_secs = 120
         assert!(cfg.read_on_stop);
         assert_eq!(cfg.policy.history_depth, 15);
         assert_eq!(cfg.reader.effort, "max");
-        assert_eq!(cfg.stores, vec!["/var/lib/assay-shared"]);
+        assert_eq!(cfg.stores, vec!["/var/lib/carat-shared"]);
     }
 }

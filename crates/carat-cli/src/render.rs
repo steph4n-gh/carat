@@ -1,6 +1,6 @@
-use assay_core::lockfile::RouteEdge;
-use assay_core::model::{Decision, FileRole, OriginClass, ResidualDiff, TransitionLedger, Verdict};
-use assay_core::reader::ReadingRecord;
+use carat_core::lockfile::RouteEdge;
+use carat_core::model::{Decision, FileRole, OriginClass, ResidualDiff, TransitionLedger, Verdict};
+use carat_core::reader::ReadingRecord;
 
 pub struct TransitionReportItem {
     pub ledger: TransitionLedger,
@@ -276,7 +276,7 @@ pub fn render_explain_markdown(item: &TransitionReportItem) -> String {
             out.push_str(&format!("        - {r}\n"));
         }
         out.push_str(&format!(
-            "      approve with: assay approve {}\n",
+            "      approve with: carat approve {}\n",
             &decision.ledger_id[..16]
         ));
     }
@@ -325,7 +325,7 @@ pub fn render_change_summary(
     }
 
     out.push_str(&format!(
-        "Assay: {unapproved_stops} of {total} changed package(s) need a person\n\n"
+        "Carat: {unapproved_stops} of {total} changed package(s) need a person\n\n"
     ));
 
     for item in items

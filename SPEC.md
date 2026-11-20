@@ -1,10 +1,10 @@
-# Assay: a balance sheet for dependency changes
+# Carat: a balance sheet for dependency changes
 
 **Specification, draft 0.2 — 2026-11-19**
 
-"Assay" is a working name (an assay is a test of what a substance is actually made of). Rename freely.
+"Carat" is a working name (an carat is a test of what a substance is actually made of). Rename freely.
 
-This document defines Assay as a fresh, standalone product in its own repository. It does not depend on any legacy codebase or data.
+This document defines Carat as a fresh, standalone product in its own repository. It does not depend on any legacy codebase or data.
 
 **Status: initial implementation and live measurement in progress.** The design rests on one core empirical assumption, stated in section 2.3, which is measured against fresh real-world npm updates and known compromises (section 13). Statements about the outside world carry one of three marks:
 
@@ -18,7 +18,7 @@ This document defines Assay as a fresh, standalone product in its own repository
 
 When a project takes a dependency update, it admits new code written by strangers. Today almost nobody reads that code, because there is too much of it.
 
-Assay makes the amount that needs reading small, and then reads it. For every package a change touches, it asks one question of every changed byte: **where did this come from?** A byte is explained if it is identical to the version the project already has, or identical to the public source at the commit the release claims to be built from. Whatever is left is **unexplained**. Unexplained bytes are read by a model, and anything the model cannot square with the stated change goes to a person.
+Carat makes the amount that needs reading small, and then reads it. For every package a change touches, it asks one question of every changed byte: **where did this come from?** A byte is explained if it is identical to the version the project already has, or identical to the public source at the commit the release claims to be built from. Whatever is left is **unexplained**. Unexplained bytes are read by a model, and anything the model cannot square with the stated change goes to a person.
 
 The governing rule is: **nothing appears from nowhere.**
 
@@ -55,7 +55,7 @@ Nothing in the normal update flow checks whether the bytes being admitted corres
 
 > For ordinary releases of ordinary packages, most changed bytes can be explained deterministically, and the remainder is small enough to read. For releases published with stolen credentials, the changed bytes cannot be explained, and that shows up without any model judgment.
 
-**[unmeasured]** If the first half is false, Assay floods people with stops and nobody leaves it on. Many legitimate packages ship built files that are not in their repository, so this is a real risk. Section 13 tests it first.
+**[unmeasured]** If the first half is false, Carat floods people with stops and nobody leaves it on. Many legitimate packages ship built files that are not in their repository, so this is a real risk. Section 13 tests it first.
 
 ### 2.4 Who it is for
 
@@ -85,7 +85,7 @@ Two rules come from the predecessor project, Tau-Gate (section 15):
 
 ### Claims discipline
 
-Assay reports facts and one of three verdicts. It never states or implies that a package is safe, benign, or free of malware. "Explained" means every changed byte has a checkable origin and nothing new is reachable. An explained release can still be harmful if the harm is committed openly to the source (section 12.3).
+Carat reports facts and one of three verdicts. It never states or implies that a package is safe, benign, or free of malware. "Explained" means every changed byte has a checkable origin and nothing new is reachable. An explained release can still be harmful if the harm is committed openly to the source (section 12.3).
 
 Any public claim about detection or coverage must come from a test whose protocol and pass marks were fixed before it ran.
 
@@ -246,7 +246,7 @@ For each file in the new artifact that is not carried from the reference:
 
 Git is used for object access only: no checkout, no hooks, no submodule initialization, no smudge filters, no replacement objects, no lazy fetching beyond the objects explicitly requested.
 
-Assay relies on Git's object model for the statement "this blob is in the tree of this commit." That reliance on SHA-1 with collision detection is a stated limitation.
+Carat relies on Git's object model for the statement "this blob is in the tree of this commit." That reliance on SHA-1 with collision detection is a stated limitation.
 
 #### Origin classes
 
@@ -282,7 +282,7 @@ Also recorded: `registry_manifest_differs`, when the registry's metadata for the
 
 The habit profile is built from the package's last `K` releases published before the new one (default `K = 20`), using the registry's per-version metadata and the artifact profiles of the reference artifact.
 
-Registry metadata is unsigned and can change. Assay records the SHA-256 of the metadata snapshot it used and labels everything derived from it as asserted by the registry.
+Registry metadata is unsigned and can change. Carat records the SHA-256 of the metadata snapshot it used and labels everything derived from it as asserted by the registry.
 
 **Breaks:**
 
@@ -297,7 +297,7 @@ Registry metadata is unsigned and can change. Assay records the SHA-256 of the m
 | `native_or_binary_new` | First appearance of native addons or executable binaries | stop |
 | `registry_manifest_differs` | See section 7.3 | stop |
 | `known_malicious` | An advisory database (OSV in version 1) lists this exact version as malicious. Absence of an advisory proves nothing | stop |
-| `tag_moved` | The tag for a version Assay has recorded before now points to a different commit | stop |
+| `tag_moved` | The tag for a version Carat has recorded before now points to a different commit | stop |
 | `publisher_changed` | Publishing account or trusted-publisher configuration not seen in the last `K` releases | flag |
 | `dependency_added` | A runtime dependency name was added | flag |
 | `size_jump` | File count or unpacked size outside the band of the last `K` releases | flag |
@@ -356,7 +356,7 @@ Nothing is silently truncated. A unit over the per-call budget is split into ove
 
 #### The reader contract
 
-The reader is either the built-in Anthropic reader inside the single `assay` binary or any external executable configured via `reader.command` (receiving a packet as JSON on standard input and returning a findings object as JSON on standard output).
+The reader is either the built-in Anthropic reader inside the single `carat` binary or any external executable configured via `reader.command` (receiving a packet as JSON on standard input and returning a findings object as JSON on standard output).
 
 Findings schema (full version in Appendix B):
 
@@ -378,7 +378,7 @@ Categories: `exfiltration`, `remote_code`, `credential_access`, `persistence`, `
 
 #### Reference reader
 
-- Built into the single `assay` binary (calling the Anthropic Messages API directly over hardened HTTPS) so end users need no secondary Python or Node runtime, while preserving the external subprocess reader contract for custom models or local runners.
+- Built into the single `carat` binary (calling the Anthropic Messages API directly over hardened HTTPS) so end users need no secondary Python or Node runtime, while preserving the external subprocess reader contract for custom models or local runners.
 - Default model: `claude-opus-5-5`, set in configuration and recorded in every reading. Reasoning effort is set explicitly because that model's default is `medium`.
 - Output constrained with structured outputs (`output_config.format` with a JSON schema). The default model rejects forced tool choice, so structured outputs are the mechanism.
 - The fixed instructions go first in the request so that prompt caching applies; the packet goes after them.
@@ -425,7 +425,7 @@ Residual risk: a payload that needs no new reach, sits in bytes that are legitim
 
 The settled relaxation is an assumption, the same one a cooldown relies on, over a longer window: a release that has been public for a month without an advisory has survived some exposure. It is not evidence about the bytes, which is why the reading still happens. A reading is paid for once per pair of artifacts and then reused.
 
-The fresh rule is where Assay earns its keep against a plain cooldown. A fresh release that is fully explained can be taken immediately, which matters when the release is a security fix.
+The fresh rule is where Carat earns its keep against a plain cooldown. A fresh release that is fully explained can be taken immediately, which matters when the release is a security fix.
 
 ### Stop rules
 
@@ -485,7 +485,7 @@ A **ledger** is a timeless, deterministic fact record. Its identifier (`ledger_i
 
 Contents: both profile identifiers; reference standing; `published_at` (RFC 3339 string from the registry snapshot, never a relative age); per-file origin classes with `carried` applied; totals in files and bytes per class; breaks and flags; new reach and new hostnames; the registry metadata snapshot hash; tool version.
 
-Time-dependent policy rules (`S6` settled exemption, `S9` freshness) and the final verdict are computed in a **Decision** evaluated at an explicit `as_of` timestamp (default `now` in live runs, PR timestamp in historical replays, saved in input bundles for `assay replay`). Separating the timeless ledger from the `as_of` decision guarantees both byte-identical caching across time and exact replay.
+Time-dependent policy rules (`S6` settled exemption, `S9` freshness) and the final verdict are computed in a **Decision** evaluated at an explicit `as_of` timestamp (default `now` in live runs, PR timestamp in historical replays, saved in input bundles for `carat replay`). Separating the timeless ledger from the `as_of` decision guarantees both byte-identical caching across time and exact replay.
 
 ### 9.3 Reading
 
@@ -515,14 +515,14 @@ Example record in Appendix A.
 
 | Command | Purpose |
 | --- | --- |
-| `assay explain <name>@<from>..<to>` | Check one transition straight from the registry and print the ledger. Needs no project. This is the demonstration |
-| `assay check --base <lock> --head <lock>` | Check a change given lockfile and manifest files |
-| `assay pr --base <rev> --head <rev>` | The same, reading both revisions from Git objects, never from the working tree |
-| `assay add <name>[@<version>]` | Check a dependency before it is installed |
-| `assay approve <subject>` | Record a person's approval of a stop |
-| `assay exposure <name>@<version>` or `--sha512 <hex>` | Report where and when given bytes were admitted |
-| `assay inventory --lock <lock>` | Profile everything currently in a lockfile. Never blocks; shows standing debt |
-| `assay replay <bundle>` | Recompute deterministic records offline from a saved input bundle |
+| `carat explain <name>@<from>..<to>` | Check one transition straight from the registry and print the ledger. Needs no project. This is the demonstration |
+| `carat check --base <lock> --head <lock>` | Check a change given lockfile and manifest files |
+| `carat pr --base <rev> --head <rev>` | The same, reading both revisions from Git objects, never from the working tree |
+| `carat add <name>[@<version>]` | Check a dependency before it is installed |
+| `carat approve <subject>` | Record a person's approval of a stop |
+| `carat exposure <name>@<version>` or `--sha512 <hex>` | Report where and when given bytes were admitted |
+| `carat inventory --lock <lock>` | Profile everything currently in a lockfile. Never blocks; shows standing debt |
+| `carat replay <bundle>` | Recompute deterministic records offline from a saved input bundle |
 
 All commands take `--json`. Human output is a Markdown summary.
 
@@ -544,19 +544,19 @@ Carried over from Tau-Gate's working design:
 - The workflow, the tool and the policy come from the protected base revision. The tool is a release archive pinned by SHA-256.
 - The pull request's head is read as Git data and never executed.
 - A change to the workflow or to the policy file is itself a stop.
-- A maintainer other than the pull request's author, with write access, approves by posting exactly `assay approve <subject>`. The check re-verifies the author, their permission, and the subject before honouring it.
+- A maintainer other than the pull request's author, with write access, approves by posting exactly `carat approve <subject>`. The check re-verifies the author, their permission, and the subject before honouring it.
 - The summary and JSON report are kept as a workflow artifact.
 
 ### 10.4 Agents
 
-- `assay add --json` and `assay check --json` are the stable machine interface.
+- `carat add --json` and `carat check --json` are the stable machine interface.
 - An MCP server exposes the same two operations as tools.
-- A documented hook recipe intercepts package-manager install commands in a coding agent and runs `assay add` first.
+- A documented hook recipe intercepts package-manager install commands in a coding agent and runs `carat add` first.
 - An agent receives verdicts and reasons. It cannot create approvals. A stop means the agent reports to its person.
 
 ### 10.5 Exposure
 
-`assay exposure` searches the record stores and the Git history of lockfiles in the repositories it is pointed at, and reports which projects admitted the given bytes, in which commits, between which dates.
+`carat exposure` searches the record stores and the Git history of lockfiles in the repositories it is pointed at, and reports which projects admitted the given bytes, in which commits, between which dates.
 
 It sees committed lockfiles and recorded checks. It does not see installs that never touched a lockfile.
 
@@ -565,13 +565,13 @@ It sees committed lockfiles and recorded checks. It does not see installs that n
 Illustrative only, not real output:
 
 ```
-Assay: 2 of 19 changed packages need a person
+Carat: 2 of 19 changed packages need a person
 
 STOP  somepkg 5.6.0 → 5.6.1        via root → build-tool → somepkg
       1 file changed, 100% unexplained
       no tag or commit for 5.6.1; the previous 20 releases had one   (anchor_lost)
       new: reads wallet objects, contacts 1 new hostname
-      approve with: assay approve 7f3c…e21a
+      approve with: carat approve 7f3c…e21a
 
 STOP  newthing 1.0.2               added directly in package.json
       new direct dependency: needs confirmation
@@ -597,10 +597,10 @@ ok    16 packages fully explained
 
 ### 11.2 Implementation
 
-- One fresh Rust workspace producing one binary (`assay`) for core, fetch, built-in reader, gate and store. No legacy code dependencies.
+- One fresh Rust workspace producing one binary (`carat`) for core, fetch, built-in reader, gate and store. No legacy code dependencies.
 - Fetch calls the system `git` and `curl` as subprocesses with hardened arguments. This avoids pulling a TLS and HTTP dependency tree into a supply chain tool.
-- The strict streaming PAX/USTAR tar reader and canonical JSON serializer live directly in `assay-core` so archive anomaly facts, size/entry limits, and canonical hashing are enforced explicitly.
-- Every dependency is pinned in `Cargo.lock` and audited. Once Assay supports an ecosystem, Assay's own dependencies in that ecosystem are checked with Assay.
+- The strict streaming PAX/USTAR tar reader and canonical JSON serializer live directly in `carat-core` so archive anomaly facts, size/entry limits, and canonical hashing are enforced explicitly.
+- Every dependency is pinned in `Cargo.lock` and audited. Once Carat supports an ecosystem, Carat's own dependencies in that ecosystem are checked with Carat.
 - Releases are reproducible builds with published hashes. Targets: Linux x86_64 and arm64, macOS arm64.
 
 ### 11.3 Fetch rules
@@ -616,7 +616,7 @@ Starting values, taken from Tau-Gate's measured limits: 64 MiB per compressed ar
 
 ### 11.5 Determinism
 
-For a fixed tool binary and a fixed input bundle, profiles and ledgers are byte-identical on every run and every supported platform. `assay replay` exists to prove it. Readings are excluded from this guarantee.
+For a fixed tool binary and a fixed input bundle, profiles and ledgers are byte-identical on every run and every supported platform. `carat replay` exists to prove it. Readings are excluded from this guarantee.
 
 ### 11.6 Performance targets **[unmeasured]**
 
@@ -628,7 +628,7 @@ For a change with up to 20 transitions: deterministic layers under 30 seconds co
 
 ### 12.1 Attackers and outcomes
 
-| Attacker has | Typical move | What Assay does |
+| Attacker has | Typical move | What Carat does |
 | --- | --- | --- |
 | A stolen registry token, no source access | Publishes a version with code not in the repository | Deterministic stop: `anchor_lost`, `source_match_drop`, unexplained bytes with no anchor, often `provenance_lost` |
 | The same, and edits `repository` to their own copy | Makes the source "match" | Deterministic stop: `repo_changed` |
@@ -638,7 +638,7 @@ For a change with up to 20 transitions: deterministic layers under 30 seconds co
 | Nothing but a registry account | Lookalike or made-up package names, including names invented by models | New direct dependency stops for confirmation. A transitive one is checked against its own short history |
 | A registry or mirror position | Serves different bytes for the same version | The lockfile's SHA-512 binds the bytes. A changed integrity for the same version is a lock alarm. Shared records make a second hash for one version visible |
 
-### 12.2 Attacks on Assay itself
+### 12.2 Attacks on Carat itself
 
 | Attack | Defense |
 | --- | --- |
@@ -648,14 +648,14 @@ For a change with up to 20 transitions: deterministic layers under 30 seconds co
 | SHA-1 collision between a source blob and an artifact file | Equality is confirmed with SHA-256 on the actual bytes |
 | The pull request edits policy, workflow or tool | All three come from the protected base; edits are stops |
 | Poisoned shared records | Profiles and ledgers are recomputable; readings and approvals from outside the organization are not trusted before M6 |
-| A compromised Assay release | Reproducible builds, published hashes, pinned by hash in the workflow |
+| A compromised Carat release | Reproducible builds, published hashes, pinned by hash in the workflow |
 | Resource exhaustion | Per-artifact and per-run limits; a breach stops one transition |
 
-### 12.3 What Assay does not catch
+### 12.3 What Carat does not catch
 
 - Harm committed openly to the public source by someone with the right to commit.
 - A payload in legitimately unexplainable built files that uses no new reach and gets past the reading.
-- Code fetched and run at run time. Assay sees that the package can reach the network and run code, not what arrives.
+- Code fetched and run at run time. Carat sees that the package can reach the network and run code, not what arrives.
 - Installs that do not go through a checked lockfile.
 - A mismatch between what was checked and what is installed, unless the install enforces lockfile integrity (`npm ci`).
 - Anything in a package the change did not touch.
@@ -670,7 +670,7 @@ Validation runs against a **fresh corpus** of real public npm updates and known 
 
 #### Ordinary updates
 
-Two disjoint fresh samples of real public npm dependency-update pull requests (and direct package transitions via `assay explain`), split into a development set for tuning and a held-out set run once under the frozen policy.
+Two disjoint fresh samples of real public npm dependency-update pull requests (and direct package transitions via `carat explain`), split into a development set for tuning and a held-out set run once under the frozen policy.
 
 Cautions:
 
@@ -770,13 +770,13 @@ Tau-Gate is at `/Volumes/Storage/taugate4`, release 4.3.0 (release commit `808f5
 
 ### Lessons that shaped this design
 
-1. **Whole-lockfile completeness made the tool unusable.** On 120 real pull requests Tau-Gate completed 70. A post-hoc look showed 38 of the 50 failures came from packages the pull request never touched. Assay is change-scoped from the first line.
-2. **A single complete-or-incomplete answer hides everything useful.** Assay grades each file and gives a verdict per transition.
+1. **Whole-lockfile completeness made the tool unusable.** On 120 real pull requests Tau-Gate completed 70. A post-hoc look showed 38 of the 50 failures came from packages the pull request never touched. Carat is change-scoped from the first line.
+2. **A single complete-or-incomplete answer hides everything useful.** Carat grades each file and gives a verdict per transition.
 3. **"Cannot check" must never be a wall.** It is a stop on one package that a person can approve against exact bytes.
-4. **A strict archive reader rejected real packages over harmless dialect differences.** Assay records oddities as facts.
-5. **The product surface ended up in Python and shell around a Rust library.** Assay is one binary.
-6. **The graph mathematics was computed and never used by any decision.** Assay carries no fact that nothing reads.
-7. **Earlier claims had to be withdrawn.** Assay makes none until section 13 has run.
+4. **A strict archive reader rejected real packages over harmless dialect differences.** Carat records oddities as facts.
+5. **The product surface ended up in Python and shell around a Rust library.** Carat is one binary.
+6. **The graph mathematics was computed and never used by any decision.** Carat carries no fact that nothing reads.
+7. **Earlier claims had to be withdrawn.** Carat makes none until section 13 has run.
 
 ---
 
@@ -784,15 +784,15 @@ Tau-Gate is at `/Volumes/Storage/taugate4`, release 4.3.0 (release commit `808f5
 
 From one search pass on 2026-11-19. This is not a market survey. **[reported]** throughout.
 
-| Tool or feature | What it does | Relation to Assay |
+| Tool or feature | What it does | Relation to Carat |
 | --- | --- | --- |
 | `npm-verified`, npm's `package-audit`, `npm-vs-repo` | Compare a published package with its repository at a tag | The same core comparison, run by hand on one package, with no reference version, history or records |
 | vlt `reproduce` | Rebuilds a package from source and compares | A source of the `rebuilt` origin class |
 | Google OSS Rebuild | Rebuilds popular npm, PyPI and crates packages and publishes attestations | Another source of `rebuilt`; covers only popular packages |
 | pnpm `trustPolicy: no-downgrade` | Refuses a release whose publishing trust dropped | The same idea as `provenance_lost`, as one signal among several |
-| pnpm and npm `minimumReleaseAge` | Cooldown | Assay uses age as an input and can justify skipping the wait |
-| Socket and similar | Commercial analysis of packages, including model-based scanning | Closest in aim. Assay's difference is that it is local, its deterministic part is reproducible by anyone, and its results are bound to exact bytes under the user's own policy |
-| `cargo vet` | Shared human audits of Rust crates, including version-to-version audits | The model for shareable records; Assay binds to bytes and produces the first pass by machine |
+| pnpm and npm `minimumReleaseAge` | Cooldown | Carat uses age as an input and can justify skipping the wait |
+| Socket and similar | Commercial analysis of packages, including model-based scanning | Closest in aim. Carat's difference is that it is local, its deterministic part is reproducible by anyone, and its results are bound to exact bytes under the user's own policy |
+| `cargo vet` | Shared human audits of Rust crates, including version-to-version audits | The model for shareable records; Carat binds to bytes and produces the first pass by machine |
 
 What I did not find: this comparison running automatically on every update, measured against the package's own history, with the remainder read and the result recorded against exact bytes. That combination is the product. If it already exists, section 13 is still worth running before deciding anything.
 
@@ -800,7 +800,7 @@ What I did not find: this comparison running automatically on every update, meas
 
 ## 17. Decisions for the owner
 
-1. **Name.** "Assay" is a placeholder.
+1. **Name.** "Carat" is a placeholder.
 2. **License.** Apache-2.0 assumed, matching Tau-Gate.
 3. **Pass marks.** Confirm or change P2 and P3 before the experiment.
 4. **Reader.** Default model, one reading or two, and whether `read` may pass without a person.

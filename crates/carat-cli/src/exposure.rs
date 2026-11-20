@@ -1,7 +1,7 @@
 use crate::pr::read_git_file;
-use assay_core::digest::parse_sha512_sri;
-use assay_core::lockfile::parse_lockfile_packages;
-use assay_core::model::TransitionLedger;
+use carat_core::digest::parse_sha512_sri;
+use carat_core::lockfile::parse_lockfile_packages;
+use carat_core::model::TransitionLedger;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -221,11 +221,11 @@ pub fn search_store_exposure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use assay_core::digest::{sha512_hex, sha512_sri};
+    use carat_core::digest::{sha512_hex, sha512_sri};
 
     #[test]
     fn traces_exposure_window_in_git_history() {
-        let tmp = std::env::temp_dir().join(format!("assay-exp-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("carat-exp-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 

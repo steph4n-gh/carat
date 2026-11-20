@@ -1,4 +1,4 @@
-# Assay configuration (read only from the protected base revision in `assay pr`)
+# Carat configuration (read only from the protected base revision in `carat pr`)
 
 # Releases newer than min_age only pass if 100% deterministically explained.
 min_age = "24h"

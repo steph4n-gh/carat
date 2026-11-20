@@ -22,7 +22,7 @@ pub struct ApprovalRecord {
     pub note: Option<String>,
 }
 
-/// Self-contained offline input bundle for `assay replay`.
+/// Self-contained offline input bundle for `carat replay`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InputBundle {
     pub schema: u32,
@@ -99,7 +99,7 @@ pub fn write_atomic_no_symlink(target: &Path, bytes: &[u8]) -> Result<(), String
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp_path = parent.join(format!(".{base_name}.assay-tmp-{}-{nonce}", std::process::id()));
+    let tmp_path = parent.join(format!(".{base_name}.carat-tmp-{}-{nonce}", std::process::id()));
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -118,7 +118,7 @@ pub fn write_atomic_no_symlink(target: &Path, bytes: &[u8]) -> Result<(), String
     Ok(())
 }
 
-/// Content-addressed JSON store on disk (`.assay/`), plus optional read-only extra stores.
+/// Content-addressed JSON store on disk (`.carat/`), plus optional read-only extra stores.
 #[derive(Debug, Clone)]
 pub struct RecordStore {
     pub root: PathBuf,
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn saves_and_finds_approval_across_readonly_stores_and_rejects_traversal() {
-        let base = std::env::temp_dir().join(format!("assay-store-test-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("carat-store-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let ro = base.join("ro");
         let rw = base.join("rw");

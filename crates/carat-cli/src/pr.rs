@@ -106,16 +106,16 @@ pub fn list_changed_paths(
         .collect())
 }
 
-/// Flags PR edits to Assay policy, store, CI workflows/actions, `.npmrc`, or `npm-shrinkwrap.json` as hard stops (SPEC section 10.3).
+/// Flags PR edits to Carat policy, store, CI workflows/actions, `.npmrc`, or `npm-shrinkwrap.json` as hard stops (SPEC section 10.3).
 pub fn detect_protected_file_tampering(changed_paths: &[String]) -> Vec<String> {
     changed_paths
         .iter()
         .filter(|p| {
             let lower = p.to_ascii_lowercase();
-            lower == "assay.toml"
-                || lower == ".assay.toml"
-                || lower == ".assay"
-                || lower.starts_with(".assay/")
+            lower == "carat.toml"
+                || lower == ".carat.toml"
+                || lower == ".carat"
+                || lower.starts_with(".carat/")
                 || (lower.starts_with(".github/workflows/")
                     && (lower.ends_with(".yml") || lower.ends_with(".yaml")))
                 || lower.starts_with(".github/actions/")
@@ -128,10 +128,10 @@ pub fn detect_protected_file_tampering(changed_paths: &[String]) -> Vec<String> 
         .collect()
 }
 
-/// Parses exact standalone `assay approve <hex_id>` PR comments (SPEC section 10.3).
+/// Parses exact standalone `carat approve <hex_id>` PR comments (SPEC section 10.3).
 /// Enforces:
 /// - Approver has write access and MUST NOT be the PR author.
-/// - Entire trimmed comment body MUST be a single line `assay approve <16..=64 hex>` (never matched inside prose, quotes, or code blocks).
+/// - Entire trimmed comment body MUST be a single line `carat approve <16..=64 hex>` (never matched inside prose, quotes, or code blocks).
 pub fn parse_approval_comments(
     comments: &[PrComment],
     pr_author: &str,
@@ -142,10 +142,10 @@ pub fn parse_approval_comments(
             continue;
         }
         let body = c.body.trim();
-        if body.contains('\n') || body.contains('\r') || body.contains("<!-- assay-pr-report -->") {
+        if body.contains('\n') || body.contains('\r') || body.contains("<!-- carat-pr-report -->") {
             continue;
         }
-        if let Some(rest) = body.strip_prefix("assay approve ") {
+        if let Some(rest) = body.strip_prefix("carat approve ") {
             let subj = rest.trim();
             if subj.len() >= 16
                 && subj.len() <= 64
@@ -170,9 +170,9 @@ mod tests {
     fn detects_policy_and_workflow_tampering() {
         let changed = vec![
             "package-lock.json".into(),
-            "assay.toml".into(),
+            "carat.toml".into(),
             ".github/workflows/ci.yml".into(),
-            ".assay/approvals/deadbeef.json".into(),
+            ".carat/approvals/deadbeef.json".into(),
             ".npmrc".into(),
             "npm-shrinkwrap.json".into(),
             "src/index.ts".into(),
@@ -181,9 +181,9 @@ mod tests {
         assert_eq!(
             tampered,
             vec![
-                "assay.toml",
+                "carat.toml",
                 ".github/workflows/ci.yml",
-                ".assay/approvals/deadbeef.json",
+                ".carat/approvals/deadbeef.json",
                 ".npmrc",
                 "npm-shrinkwrap.json",
             ]
@@ -195,25 +195,25 @@ mod tests {
         let comments = vec![
             PrComment {
                 author: "renovate".into(),
-                body: "assay approve 7f3c1234abcd5678".into(),
+                body: "carat approve 7f3c1234abcd5678".into(),
                 has_write_access: true,
                 created_at: "2026-11-19T23:00:00Z".into(),
             },
             PrComment {
                 author: "random-user".into(),
-                body: "assay approve 7f3c1234abcd5678".into(),
+                body: "carat approve 7f3c1234abcd5678".into(),
                 has_write_access: false,
                 created_at: "2026-11-19T23:01:00Z".into(),
             },
             PrComment {
                 author: "maintainer".into(),
-                body: "Do NOT run:\n```\nassay approve 7f3c1234abcd5678\n```".into(),
+                body: "Do NOT run:\n```\ncarat approve 7f3c1234abcd5678\n```".into(),
                 has_write_access: true,
                 created_at: "2026-11-19T23:01:30Z".into(),
             },
             PrComment {
                 author: "maintainer".into(),
-                body: "  assay approve 7f3c1234abcd5678  ".into(),
+                body: "  carat approve 7f3c1234abcd5678  ".into(),
                 has_write_access: true,
                 created_at: "2026-11-19T23:02:00Z".into(),
             },
@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn reads_git_objects_without_touching_worktree() {
-        let tmp = std::env::temp_dir().join(format!("assay-pr-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("carat-pr-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -259,14 +259,14 @@ mod tests {
         .trim()
         .to_string();
 
-        std::fs::write(tmp.join("assay.toml"), "min_age = \"0h\"\n").unwrap();
+        std::fs::write(tmp.join("carat.toml"), "min_age = \"0h\"\n").unwrap();
         run(&["add", "."]);
         run(&["commit", "-m", "tamper"]);
 
         let changed = list_changed_paths(&tmp, &base, "HEAD").unwrap();
-        assert_eq!(detect_protected_file_tampering(&changed), vec!["assay.toml"]);
-        assert!(read_git_file(&tmp, &base, "assay.toml").unwrap().is_none());
-        assert!(read_git_file(&tmp, "HEAD", "assay.toml").unwrap().is_some());
+        assert_eq!(detect_protected_file_tampering(&changed), vec!["carat.toml"]);
+        assert!(read_git_file(&tmp, &base, "carat.toml").unwrap().is_none());
+        assert!(read_git_file(&tmp, "HEAD", "carat.toml").unwrap().is_some());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -5,7 +5,7 @@ pub trait McpDispatcher {
     fn call_tool(&self, name: &str, arguments: &Value) -> Result<Value, String>;
 }
 
-/// Runs Assay's JSON-RPC 2.0 stdio MCP server.
+/// Runs Carat's JSON-RPC 2.0 stdio MCP server.
 /// Agents receive verdicts, routes, and inline residual diffs; no approval tool is ever exposed.
 pub fn run_mcp_server<D: McpDispatcher>(dispatcher: &D) -> Result<(), String> {
     let stdin = std::io::stdin();
@@ -57,7 +57,7 @@ pub fn handle_jsonrpc_line<D: McpDispatcher>(line: &str, dispatcher: &D) -> Opti
                     "tools": {}
                 },
                 "serverInfo": {
-                    "name": "assay",
+                    "name": "carat",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }
@@ -82,7 +82,7 @@ pub fn handle_jsonrpc_line<D: McpDispatcher>(line: &str, dispatcher: &D) -> Opti
                 .cloned()
                 .unwrap_or_else(|| json!({}));
 
-            if !matches!(tool_name, "assay_explain" | "assay_check" | "assay_add") {
+            if !matches!(tool_name, "carat_explain" | "carat_check" | "carat_add") {
                 json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -138,7 +138,7 @@ pub fn handle_jsonrpc_line<D: McpDispatcher>(line: &str, dispatcher: &D) -> Opti
 pub fn mcp_tools_schema() -> Value {
     json!([
         {
-            "name": "assay_explain",
+            "name": "carat_explain",
             "description": "Compute a byte-level balance sheet and inline residual diffs for one npm package transition (<name>@<from>..<to>). Never approves stops.",
             "inputSchema": {
                 "type": "object",
@@ -150,7 +150,7 @@ pub fn mcp_tools_schema() -> Value {
             }
         },
         {
-            "name": "assay_check",
+            "name": "carat_check",
             "description": "Check all package transitions between a base and head package-lock.json (lockfile v3). Returns per-transition verdicts, routes, residual diffs, and stop reasons. Never approves stops.",
             "inputSchema": {
                 "type": "object",
@@ -165,7 +165,7 @@ pub fn mcp_tools_schema() -> Value {
             }
         },
         {
-            "name": "assay_add",
+            "name": "carat_add",
             "description": "Resolve and check an npm dependency in an isolated temp directory with --ignore-scripts. If install=true and EVERY transition passes, atomically writes the exact checked lockfile and runs `npm ci --ignore-scripts` (zero re-resolution). Stops require human approval.",
             "inputSchema": {
                 "type": "object",
@@ -199,7 +199,7 @@ mod tests {
             &handle_jsonrpc_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#, &disp).unwrap(),
         )
         .unwrap();
-        assert_eq!(init_resp["result"]["serverInfo"]["name"], "assay");
+        assert_eq!(init_resp["result"]["serverInfo"]["name"], "carat");
 
         let list_resp: Value = serde_json::from_str(
             &handle_jsonrpc_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &disp).unwrap(),
@@ -207,12 +207,12 @@ mod tests {
         .unwrap();
         let tools = list_resp["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["assay_explain", "assay_check", "assay_add"]);
+        assert_eq!(names, vec!["carat_explain", "carat_check", "carat_add"]);
         assert!(!names.iter().any(|n| n.contains("approve")));
 
         let bad_resp: Value = serde_json::from_str(
             &handle_jsonrpc_line(
-                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"assay_approve","arguments":{}}}"#,
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"carat_approve","arguments":{}}}"#,
                 &disp,
             )
             .unwrap(),
@@ -222,7 +222,7 @@ mod tests {
 
         let ok_resp: Value = serde_json::from_str(
             &handle_jsonrpc_line(
-                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"assay_explain","arguments":{"spec":"chalk@6.0.0..6.0.1"}}}"#,
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"carat_explain","arguments":{"spec":"chalk@6.0.0..6.0.1"}}}"#,
                 &disp,
             )
             .unwrap(),

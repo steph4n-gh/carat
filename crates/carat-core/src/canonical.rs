@@ -2,7 +2,7 @@ use crate::digest::sha256_hex;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-/// Serializes any `Serialize` value into Assay canonical JSON:
+/// Serializes any `Serialize` value into Carat canonical JSON:
 /// UTF-8, object keys sorted lexicographically (UTF-8 / Unicode code point order),
 /// no insignificant whitespace.
 pub fn to_canonical_json<T: Serialize>(value: &T) -> Result<String, String> {

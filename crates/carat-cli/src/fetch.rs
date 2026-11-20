@@ -1,10 +1,10 @@
-use assay_core::archive::{LoadedArchive, strip_archive_root};
-use assay_core::canonical::parse_rfc3339_unix;
-use assay_core::digest::{parse_sha512_sri, sha256_hex};
-use assay_core::history::ReleaseMetaSummary;
-use assay_core::model::{Anchor, AnchorMethod, ArchiveLimits, ManifestFacts};
-use assay_core::normalize::canonicalize_repo_url;
-use assay_core::source::SourceSnapshot;
+use carat_core::archive::{LoadedArchive, strip_archive_root};
+use carat_core::canonical::parse_rfc3339_unix;
+use carat_core::digest::{parse_sha512_sri, sha256_hex};
+use carat_core::history::ReleaseMetaSummary;
+use carat_core::model::{Anchor, AnchorMethod, ArchiveLimits, ManifestFacts};
+use carat_core::normalize::canonicalize_repo_url;
+use carat_core::source::SourceSnapshot;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -122,7 +122,7 @@ impl Fetcher {
             None => {
                 // Disallow cross-host redirects on artifact fetches.
                 let b = curl_get(tarball_url, &[], false)?;
-                let actual_hex = assay_core::digest::sha512_hex(&b);
+                let actual_hex = carat_core::digest::sha512_hex(&b);
                 if let Some(ref exp) = expected_sha512 {
                     if !actual_hex.eq_ignore_ascii_case(exp) {
                         return Err(format!(
@@ -139,7 +139,7 @@ impl Fetcher {
             }
         };
 
-        assay_core::archive::inspect_tgz(&compressed, expected_sha512.as_deref(), limits)
+        carat_core::archive::inspect_tgz(&compressed, expected_sha512.as_deref(), limits)
     }
 
     pub fn fetch_provenance(
@@ -624,12 +624,12 @@ impl Fetcher {
             fs::create_dir_all(&repo_dir).map_err(|e| format!("mkdir git cache: {e}"))?;
             run_git(&repo_dir, &["init", "--bare", "--quiet"])?;
         }
-        // Always pin a clean bare git config so a planted `.assay/cache/git/<key>/config`
+        // Always pin a clean bare git config so a planted `.carat/cache/git/<key>/config`
         // can never inject `url.*.insteadOf`, hooks, filters, or sshCommand.
         let clean_config = format!(
             "[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = true\n[extensions]\n\tpartialclone = origin\n[remote \"origin\"]\n\turl = {repo_url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n\tpromisor = true\n\tpartialclonefilter = blob:none\n"
         );
-        assay_core::store::write_atomic_no_symlink(&repo_dir.join("config"), clean_config.as_bytes())?;
+        carat_core::store::write_atomic_no_symlink(&repo_dir.join("config"), clean_config.as_bytes())?;
 
         // Check if commit object is already in local bare cache; if not, fetch shallow without blobs.
         let has_commit = run_git(&repo_dir, &["cat-file", "-e", &format!("{commit}^{{commit}}")]).is_ok();
@@ -882,7 +882,7 @@ pub fn build_release_history(
         "prior": prior,
         "new": new_summary,
     });
-    let slice_sha256 = assay_core::canonical::canonical_id(&slice_obj)
+    let slice_sha256 = carat_core::canonical::canonical_id(&slice_obj)
         .unwrap_or_else(|_| sha256_hex(slice_obj.to_string().as_bytes()));
 
     HistoricalSlice {
@@ -950,7 +950,7 @@ fn curl_get(url: &str, extra_headers: &[&str], allow_redirects: bool) -> Result<
         "--max-time",
         "30",
         "--user-agent",
-        "assay/0.1",
+        "carat/0.1",
     ]);
     if allow_redirects {
         cmd.args(["--location", "--max-redirs", "5"]);
@@ -1262,7 +1262,7 @@ fn is_hex_commit(s: &str) -> bool {
 }
 
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    // Simple standard base64 decode without adding extra dependency to assay-cli.
+    // Simple standard base64 decode without adding extra dependency to carat-cli.
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let mut buf: u32 = 0;
     let mut bits: u32 = 0;

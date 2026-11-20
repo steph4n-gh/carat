@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Coding-agent PreToolUse hook for Bash tool calls.
 # Blocks raw `npm install` / `npm i` / `npm add` / `npm update` calls (including wrappers and aliases)
-# so agents MUST use Assay's zero-TOCTOU single-resolution installer (`assay add <pkg> --install`)
-# or `npm ci --ignore-scripts` on an Assay-verified lockfile.
+# so agents MUST use Carat's zero-TOCTOU single-resolution installer (`carat add <pkg> --install`)
+# or `npm ci --ignore-scripts` on an Carat-verified lockfile.
 #
 # Compatible with stock macOS /bin/bash 3.2 AND bash 5+.
 # Exit 0 = allow command
-# Exit 2 = block command (agent receives stderr explaining the safe Assay command)
+# Exit 2 = block command (agent receives stderr explaining the safe Carat command)
 set -euo pipefail
 
 PAYLOAD="$(cat)"
@@ -20,7 +20,7 @@ if not raw.strip():
 try:
     data = json.loads(raw)
 except Exception as e:
-    sys.stderr.write(f"Assay hook error: invalid JSON payload: {e}\n")
+    sys.stderr.write(f"Carat hook error: invalid JSON payload: {e}\n")
     sys.exit(3)
 
 cmd = (
@@ -110,7 +110,7 @@ PARSE_RC=$?
 set -e
 
 if [[ "$PARSE_RC" -ne 0 ]]; then
-  echo "BLOCKED by Assay hook: failed to parse hook payload (exit ${PARSE_RC})." >&2
+  echo "BLOCKED by Carat hook: failed to parse hook payload (exit ${PARSE_RC})." >&2
   exit 2
 fi
 
@@ -118,15 +118,15 @@ if [[ -z "$MATCHED" ]]; then
   exit 0
 fi
 
-echo "BLOCKED by Assay pre-install hook: direct 'npm install' / 'npm add' / 'npm update' is disabled to prevent re-resolution TOCTOU and lifecycle-script execution." >&2
-echo "Use Assay as the installer instead:" >&2
+echo "BLOCKED by Carat pre-install hook: direct 'npm install' / 'npm add' / 'npm update' is disabled to prevent re-resolution TOCTOU and lifecycle-script execution." >&2
+echo "Use Carat as the installer instead:" >&2
 while IFS= read -r TARGET; do
   [[ -z "$TARGET" ]] && continue
   if [[ "$TARGET" == npm\ * || "$TARGET" == "unparseable shell command" ]]; then
-    echo "  assay check --base <old-lock> --head <new-lock> --json && npm ci --ignore-scripts" >&2
+    echo "  carat check --base <old-lock> --head <new-lock> --json && npm ci --ignore-scripts" >&2
   else
-    echo "  assay add ${TARGET} --install --json" >&2
+    echo "  carat add ${TARGET} --install --json" >&2
   fi
 done <<< "$MATCHED"
-echo "Do NOT bypass this hook or run 'assay approve'. Escalate any stop verdict to the human." >&2
+echo "Do NOT bypass this hook or run 'carat approve'. Escalate any stop verdict to the human." >&2
 exit 2

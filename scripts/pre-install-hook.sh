@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
 # Coding-agent PreToolUse hook for Bash tool calls.
-# Redirects `npm install <pkg>` / `npm i <pkg>` / `npm add <pkg>` to Assay's
-# single-resolution installer (`assay add <pkg> --install`) or gates before install.
+# Blocks raw `npm install` / `npm i` / `npm add` / `npm update` calls (including wrappers and aliases)
+# so agents MUST use Assay's zero-TOCTOU single-resolution installer (`assay add <pkg> --install`)
+# or `npm ci --ignore-scripts` on an Assay-verified lockfile.
 #
 # Compatible with stock macOS /bin/bash 3.2 AND bash 5+.
 # Exit 0 = allow command
-# Exit 2 = block command (agent receives stderr with stop reasons & approval subject)
+# Exit 2 = block command (agent receives stderr explaining the safe Assay command)
 set -euo pipefail
 
 PAYLOAD="$(cat)"
 
-PARSED="$(python3 - "$PAYLOAD" <<'PY'
-import json, re, shlex, sys
+PY_SCRIPT='
+import json, os, re, shlex, sys
 
-raw = sys.argv[1]
+raw = sys.stdin.read()
+if not raw.strip():
+    sys.exit(0)
 try:
     data = json.loads(raw)
-except Exception:
-    sys.exit(0)
+except Exception as e:
+    sys.stderr.write(f"Assay hook error: invalid JSON payload: {e}\n")
+    sys.exit(3)
 
 cmd = (
     data.get("tool_input", {}).get("command")
@@ -27,9 +31,14 @@ cmd = (
 if not isinstance(cmd, str) or not cmd.strip():
     sys.exit(0)
 
-# Split simple shell chains/newlines and inspect each segment.
-segments = re.split(r'(?:\s*(?:&&|\|\||;|\|)\s*|\n+)', cmd)
-pkgs = []
+NPM_MUTATING = {
+    "install", "i", "in", "ins", "inst", "insta", "instal", "isnt", "isnta", "isntal", "isntall",
+    "add", "update", "up", "upgrade", "udpate", "install-test", "it",
+}
+FLAGS_WITH_VAL = {"--prefix", "--registry", "--workspace", "-w", "--tag", "--userconfig", "--cache", "-C"}
+
+segments = re.split(r"(?:\s*(?:&&|\|\||;|\|)\s*|\n+)", cmd)
+blocked = []
 for seg in segments:
     seg = seg.strip()
     if not seg:
@@ -37,66 +46,87 @@ for seg in segments:
     try:
         tokens = shlex.split(seg)
     except ValueError:
+        blocked.append("unparseable shell command")
         continue
-    if len(tokens) < 3:
+
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok in ("env", "command", "nohup"):
+            idx += 1
+            continue
+        if "=" in tok and not tok.startswith("-"):
+            idx += 1
+            continue
+        break
+    if idx >= len(tokens):
         continue
-    if tokens[0] == "npm" and tokens[1] in ("install", "i", "add"):
+
+    prog = os.path.basename(tokens[idx])
+    if prog != "npm":
+        continue
+
+    sub_idx = idx + 1
+    skip_next = False
+    subcmd = None
+    while sub_idx < len(tokens):
+        tok = tokens[sub_idx]
+        if skip_next:
+            skip_next = False
+            sub_idx += 1
+            continue
+        if tok in FLAGS_WITH_VAL:
+            skip_next = True
+            sub_idx += 1
+            continue
+        if tok.startswith("-"):
+            sub_idx += 1
+            continue
+        subcmd = tok
+        break
+
+    if subcmd in NPM_MUTATING:
+        pkgs = []
         skip_next = False
-        for tok in tokens[2:]:
+        for tok in tokens[sub_idx + 1:]:
             if skip_next:
                 skip_next = False
                 continue
-            if tok in ("--prefix", "--registry", "--workspace", "-w", "--tag"):
+            if tok in FLAGS_WITH_VAL:
                 skip_next = True
                 continue
             if tok.startswith("-"):
                 continue
             pkgs.append(tok)
+        blocked.append(" ".join(pkgs) if pkgs else f"npm {subcmd}")
 
-for p in pkgs:
-    print(p)
-PY
-)"
+for item in blocked:
+    print(item)
+'
 
-if [[ -z "$PARSED" ]]; then
-  exit 0
-fi
+set +e
+MATCHED="$(printf '%s' "$PAYLOAD" | python3 -c "$PY_SCRIPT")"
+PARSE_RC=$?
+set -e
 
-ASSAY_BIN="${ASSAY_BIN:-$(command -v assay || echo "$HOME/.local/bin/assay")}"
-if [[ ! -x "$ASSAY_BIN" ]]; then
-  echo "BLOCKED by Assay hook: assay binary not found (set ASSAY_BIN or run ./scripts/install.sh)." >&2
+if [[ "$PARSE_RC" -ne 0 ]]; then
+  echo "BLOCKED by Assay hook: failed to parse hook payload (exit ${PARSE_RC})." >&2
   exit 2
 fi
 
-GLOBAL_ARGS=()
-if [[ -n "${ASSAY_STORE_DIR:-}" ]]; then
-  GLOBAL_ARGS+=(--store-dir "$ASSAY_STORE_DIR")
+if [[ -z "$MATCHED" ]]; then
+  exit 0
 fi
 
-SUB_ARGS=()
-if [[ "${ASSAY_READ:-0}" == "1" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
-  SUB_ARGS+=(--read)
-fi
-
-while IFS= read -r PKG; do
-  [[ -z "$PKG" ]] && continue
-  echo "Assay pre-install gate checking ${PKG}..." >&2
-  set +e
-  "$ASSAY_BIN" ${GLOBAL_ARGS[@]+"${GLOBAL_ARGS[@]}"} add "$PKG" ${SUB_ARGS[@]+"${SUB_ARGS[@]}"} >&2
-  RC=$?
-  set -e
-  if [[ "$RC" -eq 1 ]]; then
-    echo "" >&2
-    echo "BLOCKED by Assay: ${PKG} triggered an unapproved stop." >&2
-    echo "Do NOT bypass this gate or run 'assay approve'. Report the stop reasons, leftover diff, and approval subject above to the user." >&2
-    exit 2
-  elif [[ "$RC" -ne 0 ]]; then
-    echo "" >&2
-    echo "BLOCKED by Assay: operational error (exit ${RC}) while checking ${PKG}. Fix the error instead of installing blindly." >&2
-    exit 2
+echo "BLOCKED by Assay pre-install hook: direct 'npm install' / 'npm add' / 'npm update' is disabled to prevent re-resolution TOCTOU and lifecycle-script execution." >&2
+echo "Use Assay as the installer instead:" >&2
+while IFS= read -r TARGET; do
+  [[ -z "$TARGET" ]] && continue
+  if [[ "$TARGET" == npm\ * || "$TARGET" == "unparseable shell command" ]]; then
+    echo "  assay check --base <old-lock> --head <new-lock> --json && npm ci --ignore-scripts" >&2
+  else
+    echo "  assay add ${TARGET} --install --json" >&2
   fi
-done <<< "$PARSED"
-
-# Even when the check passes, remind agents to prefer `assay add <pkg> --install`
-# so npm installs the exact checked lockfile via `npm ci --ignore-scripts` with zero re-resolution.
-exit 0
+done <<< "$MATCHED"
+echo "Do NOT bypass this hook or run 'assay approve'. Escalate any stop verdict to the human." >&2
+exit 2

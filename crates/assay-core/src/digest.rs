@@ -19,18 +19,29 @@ pub fn sha512_sri(bytes: &[u8]) -> String {
 }
 
 /// Parses an npm SRI integrity string (`sha512-<base64>`) into lowercase hex.
-/// Returns `None` if it is not a valid SHA-512 SRI string.
+/// Returns `None` if it is not a valid single-digest SHA-512 SRI string.
+/// Rejecting multiple `sha512-` tokens prevents npm `ssri` OR-ed tarball substitution.
 pub fn parse_sha512_sri(sri: &str) -> Option<String> {
+    let mut found: Option<String> = None;
     for token in sri.split_whitespace() {
         if let Some(b64) = token.strip_prefix("sha512-") {
             if let Ok(decoded) = BASE64_STANDARD.decode(b64) {
                 if decoded.len() == 64 {
-                    return Some(hex_encode(&decoded));
+                    let hex = hex_encode(&decoded);
+                    if found.is_some() {
+                        // Multiple sha512 digests in one SRI string are OR-ed by npm's ssri; fail closed.
+                        return None;
+                    }
+                    found = Some(hex);
+                } else {
+                    return None;
                 }
+            } else {
+                return None;
             }
         }
     }
-    None
+    found
 }
 
 /// Computes the Git blob object identifier: SHA-1("blob " + len + "\0" + bytes).
@@ -69,7 +80,10 @@ mod tests {
             "ce013625030ba8dba906f756967f9e9ca394464a"
         );
         let sri = sha512_sri(b"assay");
+        let sri2 = sha512_sri(b"evil");
         assert_eq!(parse_sha512_sri(&sri), Some(sha512_hex(b"assay")));
+        assert_eq!(parse_sha512_sri(&format!("{sri} {sri2}")), None);
+        assert_eq!(parse_sha512_sri(&format!("{sri} {sri}")), None);
         assert_eq!(parse_sha512_sri("sha256-AAAA"), None);
     }
 }

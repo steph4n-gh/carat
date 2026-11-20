@@ -112,24 +112,42 @@ pub fn build_reading_packet(
 
     let mut units = Vec::new();
     let mut skipped_non_exec_files = Vec::new();
+    let mut unit_seq: usize = 0;
+
+    let new_manifest = crate::archive::extract_manifest_facts(new_archive);
+    let mut declared_exec_rel_paths: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for p in new_manifest
+        .bin_paths
+        .iter()
+        .chain(new_manifest.entry_paths.iter())
+    {
+        declared_exec_rel_paths.insert(p.trim_start_matches("./").to_ascii_lowercase());
+    }
 
     for f in &ledger.files {
         if f.class != OriginClass::Unexplained {
             continue;
         }
-        if matches!(f.role, FileRole::Declaration | FileRole::SourceMap | FileRole::Doc) {
-            skipped_non_exec_files.push(format!("{} ({} B)", f.path, f.bytes));
+        let rel_lower = crate::archive::strip_archive_root(&f.path).to_ascii_lowercase();
+        let is_declared_exec = declared_exec_rel_paths.contains(&rel_lower);
+        if !is_declared_exec
+            && matches!(f.role, FileRole::Declaration | FileRole::SourceMap | FileRole::Doc)
+        {
+            skipped_non_exec_files.push(format!("{} ({} B)", sanitize_unit_path(&f.path), f.bytes));
             continue;
         }
 
         let Some(new_bytes) = new_archive.contents.get(&f.path) else {
             continue;
         };
+        let safe_path = sanitize_unit_path(&f.path);
         let Ok(new_text) = std::str::from_utf8(new_bytes) else {
             // Non-UTF8 unexplained binary file -> cannot be safely read as text; mark unread.
+            unit_seq += 1;
             units.push(ReadingUnit {
-                unit_id: f.path.clone(),
-                path: f.path.clone(),
+                unit_id: format!("u{unit_seq}:{safe_path}"),
+                path: safe_path,
                 is_new_file: ref_archive
                     .map(|r| !r.contents.contains_key(&f.path))
                     .unwrap_or(true),
@@ -150,20 +168,48 @@ pub fn build_reading_packet(
         let is_new_file = ref_text.is_none();
         let (new_lines, new_split) = split_if_minified(new_text);
 
-        let raw_unit_lines: Vec<String> = match ref_text {
+        let mut raw_unit_lines: Vec<String> = match ref_text {
             Some(rt) => {
-                let (ref_lines, ref_split) = split_if_minified(rt);
-                let _ = ref_split;
+                let (ref_lines, _ref_split) = split_if_minified(rt);
                 unified_diff_lines(&ref_lines, &new_lines, 3)
             }
             None => new_lines.iter().map(|l| format!("+{l}")).collect(),
         };
 
+        // Fail closed if minified splitting normalized away whitespace/semicolon diffs on a changed file:
+        // fall back to raw line diff so unexplained changed bytes are never silently dropped!
+        if raw_unit_lines.is_empty() {
+            let fallback_new: Vec<String> = new_text.lines().map(String::from).collect();
+            raw_unit_lines = match ref_text {
+                Some(rt) => {
+                    let fallback_ref: Vec<String> = rt.lines().map(String::from).collect();
+                    unified_diff_lines(&fallback_ref, &fallback_new, 3)
+                }
+                None => fallback_new.iter().map(|l| format!("+{l}")).collect(),
+            };
+        }
+        if raw_unit_lines.is_empty() && !new_bytes.is_empty() {
+            unit_seq += 1;
+            units.push(ReadingUnit {
+                unit_id: format!("u{unit_seq}:{safe_path}"),
+                path: safe_path,
+                is_new_file,
+                is_minified_split: new_split,
+                chunk_index: 1,
+                chunk_total: 1,
+                unread: true,
+                line_count: 0,
+                lines: Vec::new(),
+            });
+            continue;
+        }
+
         let total_bytes: usize = raw_unit_lines.iter().map(|l| l.len() + 1).sum();
         if total_bytes > budgets.hard_cap_bytes {
+            unit_seq += 1;
             units.push(ReadingUnit {
-                unit_id: f.path.clone(),
-                path: f.path.clone(),
+                unit_id: format!("u{unit_seq}:{safe_path}"),
+                path: safe_path,
                 is_new_file,
                 is_minified_split: new_split,
                 chunk_index: 1,
@@ -178,15 +224,16 @@ pub fn build_reading_packet(
         let chunks = chunk_lines(&raw_unit_lines, budgets.per_call_budget_bytes, budgets.overlap_lines);
         let chunk_total = chunks.len().max(1);
         for (idx, chunk) in chunks.into_iter().enumerate() {
+            unit_seq += 1;
             let unit_id = if chunk_total == 1 {
-                f.path.clone()
+                format!("u{unit_seq}:{safe_path}")
             } else {
-                format!("{}#{}/{}", f.path, idx + 1, chunk_total)
+                format!("u{unit_seq}:{safe_path}#{}/{}", idx + 1, chunk_total)
             };
             let line_count = chunk.len();
             units.push(ReadingUnit {
                 unit_id,
-                path: f.path.clone(),
+                path: safe_path.clone(),
                 is_new_file,
                 is_minified_split: new_split,
                 chunk_index: idx + 1,
@@ -202,8 +249,11 @@ pub fn build_reading_packet(
     // include the changed non-carried executable/manifest files so the reader NEVER receives an empty packet!
     if units.is_empty() && (!ledger.flags.is_empty() || !ledger.new_reach.is_empty()) {
         for f in &ledger.files {
+            let rel_lower = crate::archive::strip_archive_root(&f.path).to_ascii_lowercase();
+            let is_declared_exec = declared_exec_rel_paths.contains(&rel_lower);
             if f.class == OriginClass::Carried
-                || matches!(f.role, FileRole::Declaration | FileRole::SourceMap | FileRole::Doc)
+                || (!is_declared_exec
+                    && matches!(f.role, FileRole::Declaration | FileRole::SourceMap | FileRole::Doc))
             {
                 continue;
             }
@@ -213,6 +263,7 @@ pub fn build_reading_packet(
             let Ok(new_text) = std::str::from_utf8(new_bytes) else {
                 continue;
             };
+            let safe_path = sanitize_unit_path(&f.path);
             let ref_text = ref_archive
                 .and_then(|r| r.contents.get(&f.path))
                 .and_then(|b| std::str::from_utf8(b).ok());
@@ -234,15 +285,16 @@ pub fn build_reading_packet(
             );
             let chunk_total = chunks.len().max(1);
             for (idx, chunk) in chunks.into_iter().enumerate() {
+                unit_seq += 1;
                 let unit_id = if chunk_total == 1 {
-                    f.path.clone()
+                    format!("u{unit_seq}:{safe_path}")
                 } else {
-                    format!("{}#{}/{}", f.path, idx + 1, chunk_total)
+                    format!("u{unit_seq}:{safe_path}#{}/{}", idx + 1, chunk_total)
                 };
                 let line_count = chunk.len();
                 units.push(ReadingUnit {
                     unit_id,
-                    path: f.path.clone(),
+                    path: safe_path.clone(),
                     is_new_file: ref_text.is_none(),
                     is_minified_split: new_split,
                     chunk_index: idx + 1,
@@ -284,6 +336,13 @@ pub fn build_reading_packet(
 
     packet.packet_hash = canonical_id(&packet)?;
     Ok(packet)
+}
+
+/// Strips control characters and newlines from untrusted archive paths before embedding in prompts.
+fn sanitize_unit_path(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_control() { '_' } else { c })
+        .collect()
 }
 
 /// Builds compact inline unified diff previews for unexplained executable/manifest files

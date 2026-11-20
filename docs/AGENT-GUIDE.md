@@ -79,15 +79,10 @@ Copy or reference `scripts/pre-install-hook.sh` (already executable in this repo
 }
 ```
 
-Environment knobs supported by `scripts/pre-install-hook.sh`:
-- `ASSAY_BIN`: path to `assay` binary (defaults to `assay` on `$PATH`, falling back to `~/.local/bin/assay`).
-- `ASSAY_READ=1`: automatically passes `--read` when `ANTHROPIC_API_KEY` is set.
-- `ASSAY_STORE_DIR`: override `.assay` store location.
-
 What the hook does:
-- Intercepts `npm install <pkg>`, `npm i <pkg>`, and `npm add <pkg>` (supports flags like `-D`, `--save-dev`, `-E`, and multiple package arguments).
-- Allows bare `npm ci` and bare `npm install` (with no package args, since lockfile changes are gated by `assay check` / `assay pr`).
-- Runs `assay add <pkg>` for each package argument; if any package exits non-zero, blocks the Bash tool call (`exit 2`) and prints the exact stop reasons and `assay approve <subject>` line so the agent can report them to the user.
+- Intercepts direct `npm install`, `npm i`, `npm add`, `npm update`, and aliases (including wrappers like `env npm ...` and flags before the subcommand).
+- Always blocks raw mutating `npm` installs (`exit 2`) and instructs the agent to run `assay add <pkg> --install --json` (or `assay check ... && npm ci --ignore-scripts`) instead—eliminating re-resolution TOCTOU and preventing lifecycle scripts from executing.
+- Reads the hook JSON payload strictly over stdin (never process argv) and fails closed (`exit 2`) if the payload cannot be parsed.
 
 ---
 

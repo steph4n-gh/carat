@@ -46,10 +46,13 @@ pub fn inspect_tgz(
         });
     }
 
-    let mut decoder = MultiGzDecoder::new(compressed);
+    // Cap total decompressed stream bytes (headers + PAX + zero-padding bombs) strictly in memory.
+    let stream_cap = limits.max_expanded_bytes.saturating_add(1);
+    let mut decoder = MultiGzDecoder::new(compressed).take(stream_cap);
     let mut entries = Vec::new();
     let mut contents = BTreeMap::new();
     let mut seen_normalized_paths: BTreeSet<String> = BTreeSet::new();
+    let mut top_level_roots: BTreeSet<String> = BTreeSet::new();
     let mut expanded_bytes: u64 = 0;
 
     let mut global_pax: BTreeMap<String, String> = BTreeMap::new();
@@ -59,11 +62,24 @@ pub fn inspect_tgz(
     let mut header = [0u8; 512];
     let mut consecutive_zero_blocks = 0u32;
     loop {
+        if decoder.limit() == 0 {
+            facts.insert(ArchiveFact::ArchiveOverLimit);
+            break;
+        }
         match read_exact_or_eof(&mut decoder, &mut header) {
-            Ok(false) => break,
+            Ok(false) => {
+                if decoder.limit() == 0 {
+                    facts.insert(ArchiveFact::ArchiveOverLimit);
+                }
+                break;
+            }
             Ok(true) => {}
             Err(_) => {
-                facts.insert(ArchiveFact::ArchiveCorrupt);
+                if decoder.limit() == 0 {
+                    facts.insert(ArchiveFact::ArchiveOverLimit);
+                } else {
+                    facts.insert(ArchiveFact::ArchiveCorrupt);
+                }
                 break;
             }
         }
@@ -75,14 +91,23 @@ pub fn inspect_tgz(
         if header.iter().all(|&b| b == 0) {
             consecutive_zero_blocks += 1;
             if consecutive_zero_blocks >= 2 {
-                // Verify only zero bytes remain to EOF.
+                // Verify only zero bytes remain to EOF (still bounded by stream_cap!).
                 let mut trailing = [0u8; 4096];
                 loop {
                     match decoder.read(&mut trailing) {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            if decoder.limit() == 0 {
+                                facts.insert(ArchiveFact::ArchiveOverLimit);
+                            }
+                            break;
+                        }
                         Ok(n) => {
                             if trailing[..n].iter().any(|&b| b != 0) {
                                 facts.insert(ArchiveFact::ArchiveCorrupt);
+                                break;
+                            }
+                            if decoder.limit() == 0 {
+                                facts.insert(ArchiveFact::ArchiveOverLimit);
                                 break;
                             }
                         }
@@ -215,9 +240,23 @@ pub fn inspect_tgz(
 
         expanded_bytes = expanded_bytes.saturating_add(size);
 
-        // Collision check (exact, case-folded, Unicode NFC).
+        // Track distinct top-level roots: npm's `strip: 1` merges multiple roots into package root,
+        // creating differential file shadowing if a tarball carries >1 top-level directory.
+        if let Some((root_seg, _)) = clean_path.split_once('/') {
+            if !root_seg.is_empty() {
+                top_level_roots.insert(root_seg.to_ascii_lowercase());
+            }
+        } else {
+            top_level_roots.insert(String::new());
+        }
+
+        // Collision check (exact, case-folded, Unicode NFC) on BOTH full path and stripped path!
         let collision_key = canonical_collision_key(&clean_path);
         if !seen_normalized_paths.insert(collision_key) {
+            facts.insert(ArchiveFact::ArchiveDuplicatePath);
+        }
+        let stripped_collision = format!("rel:{}", canonical_collision_key(strip_archive_root(&clean_path)));
+        if !seen_normalized_paths.insert(stripped_collision) {
             facts.insert(ArchiveFact::ArchiveDuplicatePath);
         }
 
@@ -238,6 +277,23 @@ pub fn inspect_tgz(
         }
     }
 
+    if top_level_roots.len() > 1 {
+        facts.insert(ArchiveFact::ArchiveCorrupt);
+    }
+
+    // Fail closed if root package.json exists in the archive but cannot be parsed as a JSON object.
+    if let Some((_, pkg_bytes)) = contents
+        .iter()
+        .find(|(p, _)| strip_archive_root(p).eq_ignore_ascii_case("package.json"))
+    {
+        if !matches!(
+            serde_json::from_slice::<Value>(strip_utf8_bom(pkg_bytes)),
+            Ok(Value::Object(_))
+        ) {
+            facts.insert(ArchiveFact::ArchiveCorrupt);
+        }
+    }
+
     entries.sort_by(|a, b| a.path.cmp(&b.path));
 
     Ok(LoadedArchive {
@@ -250,6 +306,11 @@ pub fn inspect_tgz(
         },
         contents,
     })
+}
+
+/// Strips a leading UTF-8 BOM (`\u{FEFF}`) if present, matching Node/npm `package.json` parsing.
+pub fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes)
 }
 
 /// Strips the standard single leading npm tarball directory prefix (usually `package/`)
@@ -265,7 +326,7 @@ pub fn classify_file_role(path: &str, bytes: &[u8]) -> FileRole {
     let rel = strip_archive_root(path);
     let lower = rel.to_ascii_lowercase();
 
-    if rel == "package.json" || lower.ends_with("/package.json") {
+    if rel.eq_ignore_ascii_case("package.json") || lower.ends_with("/package.json") {
         return FileRole::Manifest;
     }
     if lower.ends_with(".map") {
@@ -345,20 +406,21 @@ pub fn is_executable_binary(bytes: &[u8]) -> bool {
 pub fn extract_manifest_facts(loaded: &LoadedArchive) -> ManifestFacts {
     let mut facts = ManifestFacts::default();
 
-    // Check for root binding.gyp, binary files, and nested node_modules manifests.
+    // Check for root binding.gyp, binary files, and nested node_modules manifests (case-insensitive for APFS/NTFS parity).
     let mut root_manifest_bytes: Option<&[u8]> = None;
     for (path, bytes) in &loaded.contents {
         let rel = strip_archive_root(path);
-        if rel == "package.json" {
+        let rel_lower = rel.to_ascii_lowercase();
+        if rel_lower == "package.json" {
             root_manifest_bytes = Some(bytes.as_slice());
-        } else if rel == "binding.gyp" {
+        } else if rel_lower == "binding.gyp" {
             facts.has_binding_gyp = true;
         }
         if classify_file_role(path, bytes) == FileRole::Binary {
             facts.has_native_or_binary = true;
         }
-        if rel.starts_with("node_modules/") && rel.ends_with("/package.json") {
-            if let Ok(v) = serde_json::from_slice::<Value>(bytes) {
+        if rel_lower.starts_with("node_modules/") && rel_lower.ends_with("/package.json") {
+            if let Ok(v) = serde_json::from_slice::<Value>(strip_utf8_bom(bytes)) {
                 if let Some(scripts) = v.get("scripts").and_then(|s| s.as_object()) {
                     for hook in ["preinstall", "install", "postinstall"] {
                         if let Some(cmd) = scripts.get(hook).and_then(|c| c.as_str()) {
@@ -377,7 +439,7 @@ pub fn extract_manifest_facts(loaded: &LoadedArchive) -> ManifestFacts {
         return facts;
     };
 
-    let Ok(val) = serde_json::from_slice::<Value>(bytes) else {
+    let Ok(val) = serde_json::from_slice::<Value>(strip_utf8_bom(bytes)) else {
         facts.has_install_exec = facts.has_binding_gyp || !facts.nested_install_scripts.is_empty();
         return facts;
     };
@@ -698,5 +760,36 @@ mod tests {
         let loaded_d = inspect_tgz(&diff_tgz, None, ArchiveLimits::default()).unwrap();
         assert!(loaded_d.inventory.facts.contains(&ArchiveFact::ArchiveCorrupt));
         assert!(loaded_d.contents.contains_key("package/hidden.js"));
+
+        // UTF-8 BOM package.json + uppercase Binding.gyp must still detect install exec.
+        let mut bom_pkg = vec![0xEF, 0xBB, 0xBF];
+        bom_pkg.extend_from_slice(br#"{"name":"bom-pkg","version":"1.0.0","scripts":{"postinstall":"echo pwn"}}"#);
+        let bom_tgz = make_tgz(&[
+            ("package/package.json", &bom_pkg, b'0'),
+            ("package/Binding.gyp", b"{}", b'0'),
+        ]);
+        let loaded_bom = inspect_tgz(&bom_tgz, None, ArchiveLimits::default()).unwrap();
+        assert!(loaded_bom.inventory.facts.is_empty());
+        let mf = extract_manifest_facts(&loaded_bom);
+        assert!(mf.has_binding_gyp);
+        assert!(mf.has_install_exec);
+        assert_eq!(
+            mf.install_scripts.get("postinstall").map(String::as_str),
+            Some("echo pwn")
+        );
+
+        // Multi-root tarball (two top-level dirs) must flag ArchiveCorrupt/ArchiveDuplicatePath.
+        let multi_root = make_tgz(&[
+            ("a/package.json", br#"{"name":"x","version":"1.0.0"}"#, b'0'),
+            ("b/package.json", br#"{"name":"x","version":"1.0.0","scripts":{"postinstall":"bad"}}"#, b'0'),
+        ]);
+        let loaded_mr = inspect_tgz(&multi_root, None, ArchiveLimits::default()).unwrap();
+        assert!(loaded_mr.inventory.facts.contains(&ArchiveFact::ArchiveCorrupt));
+        assert!(loaded_mr.inventory.facts.contains(&ArchiveFact::ArchiveDuplicatePath));
+
+        // Corrupt root package.json must fail closed with ArchiveCorrupt.
+        let bad_json = make_tgz(&[("package/package.json", b"{not json", b'0')]);
+        let loaded_bad = inspect_tgz(&bad_json, None, ArchiveLimits::default()).unwrap();
+        assert!(loaded_bad.inventory.facts.contains(&ArchiveFact::ArchiveCorrupt));
     }
 }

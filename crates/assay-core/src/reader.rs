@@ -211,10 +211,11 @@ pub fn validate_reading_output(
 
         let cited_slice = unit.lines[f.start_line - 1..f.end_line].join("\n");
         let excerpt_trimmed = f.excerpt.trim();
+        let stripped_excerpt = strip_diff_prefixes(excerpt_trimmed);
         let grounded = !excerpt_trimmed.is_empty()
+            && !stripped_excerpt.trim().is_empty()
             && (cited_slice.contains(excerpt_trimmed)
-                || strip_diff_prefixes(&cited_slice)
-                    .contains(&strip_diff_prefixes(excerpt_trimmed)));
+                || strip_diff_prefixes(&cited_slice).contains(&stripped_excerpt));
         if !grounded {
             dropped += 1;
             continue;

@@ -186,8 +186,16 @@ fn run_subprocess_reader(
         );
     };
 
-    let mut child = match Command::new(prog)
-        .args(args)
+    // Scrub inherited environment so secrets (e.g. ANTHROPIC_API_KEY, GITHUB_TOKEN) never leak
+    // to external `reader.command` subprocesses.
+    let mut cmd = Command::new(prog);
+    cmd.args(args).env_clear();
+    for var in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+    let mut child = match cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -308,6 +316,7 @@ fn run_builtin_anthropic_reader(
 
     let spawn_res = Command::new("curl")
         .args([
+            "-q",
             "--silent",
             "--show-error",
             "--proto",
@@ -320,6 +329,7 @@ fn run_builtin_anthropic_reader(
             &hdr_path.display().to_string(),
             "--data-binary",
             "@-",
+            "--",
             "https://api.anthropic.com/v1/messages",
         ])
         .stdin(Stdio::piped())

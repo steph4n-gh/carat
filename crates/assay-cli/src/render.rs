@@ -277,7 +277,7 @@ pub fn render_explain_markdown(item: &TransitionReportItem) -> String {
         }
         out.push_str(&format!(
             "      approve with: assay approve {}\n",
-            &ledger.subject[..16]
+            &decision.ledger_id[..16]
         ));
     }
 

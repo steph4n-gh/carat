@@ -36,8 +36,35 @@ fn hardened_git(repo_dir: &Path) -> Command {
     cmd
 }
 
+fn validate_git_rev(rev: &str) -> Result<(), String> {
+    if rev.is_empty() || rev.starts_with('-') || rev.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!("invalid git revision '{rev}'"));
+    }
+    Ok(())
+}
+
+/// Computes `git merge-base <base_rev> <head_rev>` so un-rebased PRs are diffed cleanly against their fork point.
+pub fn git_merge_base(repo_dir: &Path, base_rev: &str, head_rev: &str) -> Result<String, String> {
+    validate_git_rev(base_rev)?;
+    validate_git_rev(head_rev)?;
+    let out = hardened_git(repo_dir)
+        .args(["merge-base", "--", base_rev, head_rev])
+        .output()
+        .map_err(|e| format!("failed spawning git merge-base: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("git merge-base failed: {}", stderr.trim()));
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        return Err("git merge-base returned empty output".into());
+    }
+    Ok(sha)
+}
+
 /// Reads `<rev>:<rel_path>` strictly from Git object storage (never touches working tree).
 pub fn read_git_file(repo_dir: &Path, rev: &str, rel_path: &str) -> Result<Option<Vec<u8>>, String> {
+    validate_git_rev(rev)?;
     let spec = format!("{rev}:{rel_path}");
     let out = hardened_git(repo_dir)
         .args(["show", &spec])
@@ -62,8 +89,10 @@ pub fn list_changed_paths(
     base_rev: &str,
     head_rev: &str,
 ) -> Result<Vec<String>, String> {
+    validate_git_rev(base_rev)?;
+    validate_git_rev(head_rev)?;
     let out = hardened_git(repo_dir)
-        .args(["diff", "--name-only", base_rev, head_rev])
+        .args(["diff", "--name-only", base_rev, head_rev, "--"])
         .output()
         .map_err(|e| format!("failed spawning git diff: {e}"))?;
     if !out.status.success() {
@@ -77,7 +106,7 @@ pub fn list_changed_paths(
         .collect())
 }
 
-/// Flags PR edits to Assay policy or workflow files as hard stops (SPEC section 10.3).
+/// Flags PR edits to Assay policy, store, CI workflows/actions, `.npmrc`, or `npm-shrinkwrap.json` as hard stops (SPEC section 10.3).
 pub fn detect_protected_file_tampering(changed_paths: &[String]) -> Vec<String> {
     changed_paths
         .iter()
@@ -85,16 +114,24 @@ pub fn detect_protected_file_tampering(changed_paths: &[String]) -> Vec<String> 
             let lower = p.to_ascii_lowercase();
             lower == "assay.toml"
                 || lower == ".assay.toml"
+                || lower == ".assay"
+                || lower.starts_with(".assay/")
                 || (lower.starts_with(".github/workflows/")
-                    && lower.contains("assay")
                     && (lower.ends_with(".yml") || lower.ends_with(".yaml")))
+                || lower.starts_with(".github/actions/")
+                || lower == ".npmrc"
+                || lower.ends_with("/.npmrc")
+                || lower == "npm-shrinkwrap.json"
+                || lower.ends_with("/npm-shrinkwrap.json")
         })
         .cloned()
         .collect()
 }
 
-/// Parses exact `assay approve <subject>` lines from PR comments.
-/// Enforces SPEC section 10.3: approver must have write access and MUST NOT be the PR author.
+/// Parses exact standalone `assay approve <hex_id>` PR comments (SPEC section 10.3).
+/// Enforces:
+/// - Approver has write access and MUST NOT be the PR author.
+/// - Entire trimmed comment body MUST be a single line `assay approve <16..=64 hex>` (never matched inside prose, quotes, or code blocks).
 pub fn parse_approval_comments(
     comments: &[PrComment],
     pr_author: &str,
@@ -104,20 +141,21 @@ pub fn parse_approval_comments(
         if !c.has_write_access || c.author.eq_ignore_ascii_case(pr_author) {
             continue;
         }
-        for line in c.body.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("assay approve ") {
-                let subj = rest.trim();
-                if subj.len() >= 12
-                    && subj.len() <= 64
-                    && subj.bytes().all(|b| b.is_ascii_hexdigit())
-                {
-                    out.push(ParsedPrApproval {
-                        subject: subj.to_ascii_lowercase(),
-                        approver: c.author.clone(),
-                        approved_at: c.created_at.clone(),
-                    });
-                }
+        let body = c.body.trim();
+        if body.contains('\n') || body.contains('\r') || body.contains("<!-- assay-pr-report -->") {
+            continue;
+        }
+        if let Some(rest) = body.strip_prefix("assay approve ") {
+            let subj = rest.trim();
+            if subj.len() >= 16
+                && subj.len() <= 64
+                && subj.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                out.push(ParsedPrApproval {
+                    subject: subj.to_ascii_lowercase(),
+                    approver: c.author.clone(),
+                    approved_at: c.created_at.clone(),
+                });
             }
         }
     }
@@ -133,18 +171,27 @@ mod tests {
         let changed = vec![
             "package-lock.json".into(),
             "assay.toml".into(),
-            ".github/workflows/assay-pr.yml".into(),
+            ".github/workflows/ci.yml".into(),
+            ".assay/approvals/deadbeef.json".into(),
+            ".npmrc".into(),
+            "npm-shrinkwrap.json".into(),
             "src/index.ts".into(),
         ];
         let tampered = detect_protected_file_tampering(&changed);
         assert_eq!(
             tampered,
-            vec!["assay.toml", ".github/workflows/assay-pr.yml"]
+            vec![
+                "assay.toml",
+                ".github/workflows/ci.yml",
+                ".assay/approvals/deadbeef.json",
+                ".npmrc",
+                "npm-shrinkwrap.json",
+            ]
         );
     }
 
     #[test]
-    fn parses_valid_maintainer_approval_and_rejects_self_approval() {
+    fn parses_valid_maintainer_approval_and_rejects_self_or_embedded_approval() {
         let comments = vec![
             PrComment {
                 author: "renovate".into(),
@@ -160,7 +207,13 @@ mod tests {
             },
             PrComment {
                 author: "maintainer".into(),
-                body: "Looks fine.\nassay approve 7f3c1234abcd5678\n".into(),
+                body: "Do NOT run:\n```\nassay approve 7f3c1234abcd5678\n```".into(),
+                has_write_access: true,
+                created_at: "2026-11-19T23:01:30Z".into(),
+            },
+            PrComment {
+                author: "maintainer".into(),
+                body: "  assay approve 7f3c1234abcd5678  ".into(),
                 has_write_access: true,
                 created_at: "2026-11-19T23:02:00Z".into(),
             },

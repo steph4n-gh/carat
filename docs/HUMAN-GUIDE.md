@@ -107,10 +107,11 @@ assay approve 7ac2cded06cdc20a --note "Reviewed diff, intentional direct dep"
 
 - **Survives rebases and tool upgrades:** same old/new tarball bytes = same subject.
 - **Automatically goes stale (`S10`)** if a new stop reason appears later (for example, a new `MAL-*` advisory or a stricter rule).
-- **In GitHub PRs:** a maintainer with write access (who is *not* the PR author) comments:
+- **In GitHub PRs:** a maintainer with write access (who is *not* the PR author) posts a standalone single-line comment with the exact `ledger` ID prefix printed in the PR report:
   ```
   assay approve 7ac2cded06cdc20a
   ```
+  Because PR comment approvals bind to the exact `ledger_id`, any change to lockfile integrity, anchors, breaks, or advisories invalidates the comment automatically. Known-malicious advisories (`MAL-*`) and reader `Concern` findings cannot be approved by PR comment alone.
 
 ---
 

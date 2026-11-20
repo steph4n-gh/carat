@@ -67,10 +67,14 @@ pub fn compare_published_manifest(
     source_bytes: &[u8],
     published_bytes: &[u8],
 ) -> ManifestNormalization {
-    let Ok(Value::Object(src_raw)) = serde_json::from_slice::<Value>(source_bytes) else {
+    let Ok(Value::Object(src_raw)) =
+        serde_json::from_slice::<Value>(crate::archive::strip_utf8_bom(source_bytes))
+    else {
         return ManifestNormalization::Unparseable;
     };
-    let Ok(Value::Object(pub_raw)) = serde_json::from_slice::<Value>(published_bytes) else {
+    let Ok(Value::Object(pub_raw)) =
+        serde_json::from_slice::<Value>(crate::archive::strip_utf8_bom(published_bytes))
+    else {
         return ManifestNormalization::Unparseable;
     };
 
@@ -253,7 +257,9 @@ pub fn registry_manifest_differs(
     registry_version_json: &Value,
     has_binding_gyp: bool,
 ) -> Vec<String> {
-    let Ok(Value::Object(art)) = serde_json::from_slice::<Value>(artifact_manifest_bytes) else {
+    let Ok(Value::Object(art)) =
+        serde_json::from_slice::<Value>(crate::archive::strip_utf8_bom(artifact_manifest_bytes))
+    else {
         return Vec::new();
     };
     let Some(reg) = registry_version_json.as_object() else {

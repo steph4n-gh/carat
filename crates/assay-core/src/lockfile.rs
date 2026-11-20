@@ -69,14 +69,38 @@ pub struct LockTransition {
 }
 
 impl LockTransition {
-    /// Deduplication key: transitions with identical `(name, ref_sha512, new_sha512)`
-    /// are checked once per run while preserving all introducer routes.
-    pub fn dedup_key(&self) -> (String, Option<String>, Option<String>) {
+    /// Deduplication key: transitions are only merged when package identity, version,
+    /// reference/new digests, resolved URL, and bundle status all match.
+    pub fn dedup_key(
+        &self,
+    ) -> (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        bool,
+    ) {
         (
             self.name.clone(),
+            self.new_version.clone(),
             self.ref_sha512.clone(),
             self.new_sha512.clone(),
+            self.new_resolved.clone(),
+            self.in_bundle,
         )
+    }
+}
+
+/// Returns the parent package's `instance_path` if `instance_path` is nested inside
+/// another package's `node_modules/` (e.g. `node_modules/a/node_modules/b` -> `Some("node_modules/a")`).
+pub fn parent_node_modules_instance(instance_path: &str) -> Option<String> {
+    let idx = instance_path.rfind("/node_modules/")?;
+    let parent = &instance_path[..idx];
+    if parent.is_empty() {
+        None
+    } else {
+        Some(parent.to_string())
     }
 }
 
@@ -118,6 +142,22 @@ pub fn parse_lockfile_packages(lock_bytes: &[u8]) -> Result<Vec<LockPackage>, St
         .and_then(|v| v.as_object())
         .ok_or_else(|| "package-lock.json missing packages map".to_string())?;
 
+    // Collect local workspace root paths referenced by `"link": true` entries so we never
+    // mistake local workspaces (e.g. `packages/sub`) for external registry packages.
+    let mut workspace_dirs: BTreeSet<String> = BTreeSet::new();
+    for entry in packages.values() {
+        if let Some(obj) = entry.as_object() {
+            if obj.get("link").and_then(|v| v.as_bool()) == Some(true) {
+                if let Some(target) = obj.get("resolved").and_then(|v| v.as_str()) {
+                    let clean = target.trim_start_matches("./").trim_end_matches('/');
+                    if !clean.is_empty() && !clean.starts_with("node_modules/") {
+                        workspace_dirs.insert(clean.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     let mut out = Vec::new();
     for (inst_path, entry) in packages {
         if inst_path.is_empty() {
@@ -128,6 +168,13 @@ pub fn parse_lockfile_packages(lock_bytes: &[u8]) -> Result<Vec<LockPackage>, St
         };
         if obj.get("link").and_then(|v| v.as_bool()) == Some(true) {
             // Workspace symlink entry inside packages map; not an external archive.
+            continue;
+        }
+        if workspace_dirs.contains(inst_path.as_str())
+            && !inst_path.starts_with("node_modules/")
+            && !inst_path.contains("/node_modules/")
+        {
+            // Local workspace definition entry (not an external package tarball).
             continue;
         }
         let name = obj
@@ -150,7 +197,10 @@ pub fn parse_lockfile_packages(lock_bytes: &[u8]) -> Result<Vec<LockPackage>, St
             .and_then(|v| v.as_str())
             .map(String::from);
         let sha512 = integrity.as_deref().and_then(parse_sha512_sri);
-        let in_bundle = obj.get("inBundle").and_then(|v| v.as_bool()) == Some(true);
+        // Only honor `inBundle: true` when nested inside a parent package's `node_modules/`.
+        // A top-level `node_modules/<pkg>` entry can never legitimately be bundled by a parent tarball.
+        let declared_in_bundle = obj.get("inBundle").and_then(|v| v.as_bool()) == Some(true);
+        let in_bundle = declared_in_bundle && parent_node_modules_instance(inst_path).is_some();
         let (source_kind, registry_host) = classify_resolved(resolved.as_deref(), in_bundle);
 
         let mut deps = BTreeMap::new();
@@ -187,6 +237,12 @@ pub fn diff_lockfiles(
 ) -> Result<LockDiff, String> {
     let base_pkgs = parse_lockfile_packages(base_lock)?;
     let head_pkgs = parse_lockfile_packages(head_lock)?;
+
+    // Verify manifest-lockfile synchronization when head package.json is supplied:
+    // every dependency declared in root package.json must be accounted for in head package-lock.json.
+    if let Some(hp_bytes) = head_pkg {
+        verify_manifest_matches_lockfile(hp_bytes, head_lock)?;
+    }
 
     let base_root = parse_root_deps(base_pkg, Some(base_lock));
     let head_root = parse_root_deps(head_pkg, Some(head_lock));
@@ -252,8 +308,13 @@ pub fn diff_lockfiles(
             {
                 alarms.insert(LockAlarm::RegistryHostChanged);
             }
-        } else if hp.source_kind != SourceKind::Registry && !hp.in_bundle {
-            alarms.insert(LockAlarm::SourceKindChanged);
+        } else if !hp.in_bundle {
+            if hp.source_kind != SourceKind::Registry {
+                alarms.insert(LockAlarm::SourceKindChanged);
+            }
+            if hp.registry_host.as_deref() != Some("registry.npmjs.org") {
+                alarms.insert(LockAlarm::RegistryHostChanged);
+            }
         }
 
         let is_new_direct =
@@ -306,17 +367,25 @@ pub fn diff_lockfiles(
     })
 }
 
-/// Deduplicates transitions that share `(name, ref_sha512, new_sha512)` while merging
-/// alarms and `is_new_direct`. Returns grouped unique transitions plus all their instance paths.
+/// Deduplicates transitions that share `(name, new_version, ref_sha512, new_sha512, new_resolved, in_bundle)`
+/// while merging alarms and `is_new_direct`. Returns grouped unique transitions plus all their instance paths.
 pub fn deduplicate_transitions(transitions: &[LockTransition]) -> Vec<(LockTransition, Vec<String>)> {
-    let mut order: Vec<(String, Option<String>, Option<String>)> = Vec::new();
-    let mut groups: BTreeMap<(String, Option<String>, Option<String>), (LockTransition, Vec<String>)> =
-        BTreeMap::new();
+    type DedupKey = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        bool,
+    );
+    let mut order: Vec<DedupKey> = Vec::new();
+    let mut groups: BTreeMap<DedupKey, (LockTransition, Vec<String>)> = BTreeMap::new();
 
     for t in transitions {
         let key = t.dedup_key();
         if let Some((rep, paths)) = groups.get_mut(&key) {
             rep.is_new_direct |= t.is_new_direct;
+            rep.in_bundle &= t.in_bundle;
             rep.lock_alarms.extend(t.lock_alarms.iter().copied());
             if !t.route.is_empty() && (rep.route.is_empty() || t.route.len() < rep.route.len()) {
                 rep.route = t.route.clone();
@@ -334,10 +403,48 @@ pub fn deduplicate_transitions(transitions: &[LockTransition]) -> Vec<(LockTrans
         .collect()
 }
 
+fn verify_manifest_matches_lockfile(pkg_bytes: &[u8], lock_bytes: &[u8]) -> Result<(), String> {
+    let pkg_val: Value = serde_json::from_slice(crate::archive::strip_utf8_bom(pkg_bytes))
+        .map_err(|e| format!("invalid package.json: {e}"))?;
+    let lock_val: Value = serde_json::from_slice(lock_bytes)
+        .map_err(|e| format!("invalid package-lock.json: {e}"))?;
+    let Some(pkg_obj) = pkg_val.as_object() else {
+        return Err("package.json is not a JSON object".into());
+    };
+    let Some(lock_packages) = lock_val.get("packages").and_then(|v| v.as_object()) else {
+        return Err("package-lock.json missing packages map".into());
+    };
+    let lock_root = lock_packages.get("").and_then(|v| v.as_object());
+
+    for sec in ["dependencies", "devDependencies", "optionalDependencies"] {
+        let Some(pkg_sec) = pkg_obj.get(sec).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (dep_name, pkg_spec) in pkg_sec {
+            let lock_spec = lock_root
+                .and_then(|r| r.get(sec))
+                .and_then(|s| s.as_object())
+                .and_then(|m| m.get(dep_name));
+            let has_node_modules = lock_packages.contains_key(&format!("node_modules/{dep_name}"));
+            if lock_spec != Some(pkg_spec) && !has_node_modules {
+                return Err(format!(
+                    "package.json {sec}.{dep_name} is not synchronized with package-lock.json"
+                ));
+            }
+            if lock_spec.is_some() && lock_spec != Some(pkg_spec) {
+                return Err(format!(
+                    "package.json {sec}.{dep_name} spec differs from package-lock.json root record"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_root_deps(pkg_bytes: Option<&[u8]>, lock_bytes: Option<&[u8]>) -> RootDeps {
     let mut root = RootDeps::default();
     let val = pkg_bytes
-        .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+        .and_then(|b| serde_json::from_slice::<Value>(crate::archive::strip_utf8_bom(b)).ok())
         .or_else(|| {
             lock_bytes
                 .and_then(|b| serde_json::from_slice::<Value>(b).ok())
@@ -348,6 +455,39 @@ fn parse_root_deps(pkg_bytes: Option<&[u8]>, lock_bytes: Option<&[u8]>) -> RootD
         collect_edge_map(&obj, "optionalDependencies", EdgeKind::Optional, &mut root.all_direct);
         collect_edge_map(&obj, "peerDependencies", EdgeKind::Peer, &mut root.all_direct);
         collect_edge_map(&obj, "devDependencies", EdgeKind::Dev, &mut root.all_direct);
+    }
+    // Include workspace root definitions from the lockfile so workspace direct deps trigger S5 and get routes.
+    if let Some(lb) = lock_bytes {
+        if let Ok(lock_val) = serde_json::from_slice::<Value>(lb) {
+            if let Some(packages) = lock_val.get("packages").and_then(|v| v.as_object()) {
+                let mut ws_dirs = BTreeSet::new();
+                for entry in packages.values() {
+                    if let Some(obj) = entry.as_object() {
+                        if obj.get("link").and_then(|v| v.as_bool()) == Some(true) {
+                            if let Some(target) = obj.get("resolved").and_then(|v| v.as_str()) {
+                                let clean = target.trim_start_matches("./").trim_end_matches('/');
+                                if !clean.is_empty() && !clean.starts_with("node_modules/") {
+                                    ws_dirs.insert(clean.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                for dir in ws_dirs {
+                    if let Some(obj) = packages.get(&dir).and_then(|v| v.as_object()) {
+                        collect_edge_map(obj, "dependencies", EdgeKind::Prod, &mut root.all_direct);
+                        collect_edge_map(
+                            obj,
+                            "optionalDependencies",
+                            EdgeKind::Optional,
+                            &mut root.all_direct,
+                        );
+                        collect_edge_map(obj, "peerDependencies", EdgeKind::Peer, &mut root.all_direct);
+                        collect_edge_map(obj, "devDependencies", EdgeKind::Dev, &mut root.all_direct);
+                    }
+                }
+            }
+        }
     }
     root
 }
@@ -497,7 +637,7 @@ fn classify_resolved(resolved: Option<&str>, in_bundle: bool) -> (SourceKind, Op
     if r.starts_with("file:") {
         return (SourceKind::File, None);
     }
-    if let Some(after_scheme) = r.strip_prefix("https://").or_else(|| r.strip_prefix("http://")) {
+    if let Some(after_scheme) = r.strip_prefix("https://") {
         let host = after_scheme
             .split('/')
             .next()
@@ -506,6 +646,15 @@ fn classify_resolved(resolved: Option<&str>, in_bundle: bool) -> (SourceKind, Op
         if r.contains("/-/") && r.ends_with(".tgz") {
             return (SourceKind::Registry, Some(host));
         }
+        return (SourceKind::Url, Some(host));
+    }
+    if let Some(after_scheme) = r.strip_prefix("http://") {
+        let host = after_scheme
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        // Plaintext http:// is never a trusted registry source.
         return (SourceKind::Url, Some(host));
     }
     (SourceKind::Unknown, None)
@@ -585,5 +734,113 @@ mod tests {
         let tc = diff.transitions.iter().find(|t| t.name == "pkg-c").unwrap();
         assert!(tc.is_new_direct);
         assert!(tc.lock_alarms.is_empty());
+    }
+
+    #[test]
+    fn blocks_forged_top_level_in_bundle_dedup_smuggling_and_http_registry() {
+        let base_lock = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": { "": {} }
+        });
+        let head_lock = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": {},
+                "node_modules/top-forged": {
+                    "version": "1.0.0",
+                    "inBundle": true
+                },
+                "node_modules/parent/node_modules/victim": {
+                    "version": "1.0.0",
+                    "inBundle": true
+                },
+                "node_modules/victim": {
+                    "version": "1.0.0",
+                    "resolved": "http://evil.invalid/victim/-/victim-1.0.0.tgz"
+                }
+            }
+        });
+
+        let diff = diff_lockfiles(
+            &serde_json::to_vec(&base_lock).unwrap(),
+            &serde_json::to_vec(&head_lock).unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let forged = diff
+            .transitions
+            .iter()
+            .find(|t| t.instance_path == "node_modules/top-forged")
+            .unwrap();
+        assert!(!forged.in_bundle);
+        assert!(forged.lock_alarms.contains(&LockAlarm::IntegrityMissing));
+        assert!(forged.lock_alarms.contains(&LockAlarm::SourceKindChanged));
+
+        // Deduplication must NOT collapse nested inBundle into top-level evil resolved URL!
+        let unique = deduplicate_transitions(&diff.transitions);
+        let victim_groups: Vec<_> = unique
+            .iter()
+            .filter(|(t, _)| t.name == "victim")
+            .collect();
+        assert_eq!(victim_groups.len(), 2);
+        let evil = victim_groups
+            .iter()
+            .find(|(t, _)| t.new_resolved.is_some())
+            .unwrap()
+            .0
+            .clone();
+        assert!(!evil.in_bundle);
+        assert!(evil.lock_alarms.contains(&LockAlarm::SourceKindChanged));
+        assert!(evil.lock_alarms.contains(&LockAlarm::RegistryHostChanged));
+    }
+
+    #[test]
+    fn handles_workspaces_without_leaking_local_dirs_and_catches_manifest_desync() {
+        let sri_a = sha512_sri(b"a-1.0.0");
+        let base_lock = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": { "": {} }
+        });
+        let head_lock = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "workspaces": ["packages/*"], "dependencies": { "ext": "^1.0.0" } },
+                "packages/sub": { "name": "@ws/sub", "version": "1.0.0", "dependencies": { "ext": "^1.0.0" } },
+                "node_modules/@ws/sub": { "resolved": "packages/sub", "link": true },
+                "node_modules/ext": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/ext/-/ext-1.0.0.tgz",
+                    "integrity": sri_a
+                }
+            }
+        });
+        let head_pkg = serde_json::json!({
+            "name": "root",
+            "dependencies": { "ext": "^1.0.0" }
+        });
+        let diff = diff_lockfiles(
+            &serde_json::to_vec(&base_lock).unwrap(),
+            &serde_json::to_vec(&head_lock).unwrap(),
+            None,
+            Some(&serde_json::to_vec(&head_pkg).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(diff.transitions.len(), 1);
+        assert_eq!(diff.transitions[0].name, "ext");
+
+        // Desynchronized package.json adding an unlisted dep must error!
+        let desync_pkg = serde_json::json!({
+            "name": "root",
+            "dependencies": { "ext": "^1.0.0", "sneaky": "1.0.0" }
+        });
+        assert!(diff_lockfiles(
+            &serde_json::to_vec(&base_lock).unwrap(),
+            &serde_json::to_vec(&head_lock).unwrap(),
+            None,
+            Some(&serde_json::to_vec(&desync_pkg).unwrap()),
+        )
+        .is_err());
     }
 }

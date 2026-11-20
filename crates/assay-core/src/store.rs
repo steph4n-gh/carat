@@ -2,8 +2,10 @@ use crate::canonical::{canonical_id, to_canonical_json};
 use crate::model::{Anchor, ArtifactProfile, Decision, TransitionLedger};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalRecord {
@@ -51,17 +53,93 @@ pub struct InputBundle {
     pub expected_ledger_id: String,
 }
 
+/// Validates that `id` is a strict ASCII hex digest (16..=128 chars, no path separators or traversal).
+pub fn validate_hex_id(id: &str) -> Result<&str, String> {
+    if !(16..=128).contains(&id.len()) || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid digest id '{id}'"));
+    }
+    Ok(id)
+}
+
+/// Validates that `name` is a single normal filename with no directory traversal, separators, or NULs.
+pub fn validate_safe_filename(name: &str) -> Result<&str, String> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(format!("unsafe filename '{name}'"));
+    }
+    let mut comps = Path::new(name).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(_)), None) => Ok(name),
+        _ => Err(format!("unsafe filename '{name}'")),
+    }
+}
+
+/// Rejects symlinks on `path` if it exists.
+pub fn reject_symlink(path: &Path) -> Result<(), String> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(format!("refusing symlink at {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Writes bytes atomically via an exclusive sibling temp file (`O_CREAT | O_EXCL`) + rename,
+/// refusing symlinks at target.
+pub fn write_atomic_no_symlink(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    reject_symlink(target)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("target {} has no parent directory", target.display()))?;
+    fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    let base_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tmp");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = parent.join(format!(".{base_name}.assay-tmp-{}-{nonce}", std::process::id()));
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .map_err(|e| format!("create temp {}: {e}", tmp_path.display()))?;
+    if let Err(e) = f.write_all(bytes) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("write temp {}: {e}", tmp_path.display()));
+    }
+    drop(f);
+    reject_symlink(target)?;
+    if let Err(e) = fs::rename(&tmp_path, target) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("rename into {}: {e}", target.display()));
+    }
+    Ok(())
+}
+
+/// Content-addressed JSON store on disk (`.assay/`), plus optional read-only extra stores.
 #[derive(Debug, Clone)]
 pub struct RecordStore {
-    root: PathBuf,
-    readonly_stores: Vec<PathBuf>,
+    pub root: PathBuf,
+    pub readonly_stores: Vec<PathBuf>,
 }
 
 impl RecordStore {
     pub fn open(root: PathBuf, readonly_stores: Vec<PathBuf>) -> Result<Self, String> {
-        for sub in ["profiles", "ledgers", "decisions", "readings", "approvals", "inputs"] {
-            fs::create_dir_all(root.join(sub))
-                .map_err(|e| format!("failed creating store dir {sub}: {e}"))?;
+        reject_symlink(&root)?;
+        for sub in [
+            "profiles",
+            "ledgers",
+            "decisions",
+            "readings",
+            "approvals",
+            "inputs",
+        ] {
+            let dir = root.join(sub);
+            reject_symlink(&dir)?;
+            fs::create_dir_all(&dir)
+                .map_err(|e| format!("failed creating store dir {}: {e}", dir.display()))?;
         }
         Ok(Self {
             root,
@@ -69,129 +147,170 @@ impl RecordStore {
         })
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
+    fn all_roots(&self) -> Vec<&Path> {
+        let mut out = vec![self.root.as_path()];
+        for r in &self.readonly_stores {
+            out.push(r.as_path());
+        }
+        out
     }
 
     pub fn save_profile(&self, profile: &ArtifactProfile) -> Result<String, String> {
         let id = canonical_id(profile)?;
-        let json = to_canonical_json(profile)?;
+        validate_hex_id(&id)?;
+        let canon = to_canonical_json(profile)?;
         let path = self.root.join("profiles").join(format!("{id}.json"));
-        fs::write(&path, json).map_err(|e| format!("write profile failed: {e}"))?;
+        write_atomic_no_symlink(&path, canon.as_bytes())?;
         Ok(id)
-    }
-
-    pub fn load_profile(&self, id: &str) -> Option<ArtifactProfile> {
-        self.read_from_any("profiles", &format!("{id}.json"))
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
     }
 
     pub fn save_ledger(&self, ledger: &TransitionLedger) -> Result<String, String> {
         let id = canonical_id(ledger)?;
-        let json = to_canonical_json(ledger)?;
+        validate_hex_id(&id)?;
+        let canon = to_canonical_json(ledger)?;
         let path = self.root.join("ledgers").join(format!("{id}.json"));
-        fs::write(&path, json).map_err(|e| format!("write ledger failed: {e}"))?;
+        write_atomic_no_symlink(&path, canon.as_bytes())?;
         Ok(id)
     }
 
-    pub fn load_ledger(&self, id: &str) -> Option<TransitionLedger> {
-        self.read_from_any("ledgers", &format!("{id}.json"))
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-    }
-
-    /// Finds the unique subject matching `subject_prefix` (requiring >= 8 hex chars and rejecting ambiguity).
-    pub fn find_unique_ledger_for_subject(
-        &self,
-        subject_prefix: &str,
-    ) -> Result<(String, TransitionLedger), String> {
-        let q = subject_prefix.trim().to_ascii_lowercase();
-        if q.len() < 8 || !q.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!(
-                "subject '{subject_prefix}' must be at least 8 hex characters"
-            ));
-        }
-
-        let mut dirs = vec![self.root.join("ledgers")];
-        for ro in &self.readonly_stores {
-            dirs.push(ro.join("ledgers"));
-        }
-
-        let mut matches_by_subject: BTreeMap<String, (String, TransitionLedger)> = BTreeMap::new();
-        for dir in dirs {
-            let Ok(entries) = fs::read_dir(dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Ok(bytes) = fs::read(&p) {
-                    if let Ok(ledger) = serde_json::from_slice::<TransitionLedger>(&bytes) {
-                        if ledger.subject == q || ledger.subject.starts_with(&q) {
-                            let id = p
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("")
-                                .to_string();
-                            matches_by_subject
-                                .entry(ledger.subject.clone())
-                                .or_insert((id, ledger));
-                        }
-                    }
-                }
-            }
-        }
-
-        match matches_by_subject.len() {
-            0 => Err(format!(
-                "no recorded ledger found in {} matching subject '{subject_prefix}'",
-                self.root.display()
-            )),
-            1 => Ok(matches_by_subject.into_values().next().unwrap()),
-            n => Err(format!(
-                "ambiguous subject prefix '{subject_prefix}' matched {n} distinct subjects; pass a longer prefix"
-            )),
-        }
-    }
-
-    pub fn save_decision(&self, decision: &Decision) -> Result<(), String> {
-        let json = to_canonical_json(decision)?;
+    pub fn save_decision(&self, decision: &Decision) -> Result<String, String> {
+        validate_hex_id(&decision.subject)?;
+        let id = canonical_id(decision)?;
+        validate_hex_id(&id)?;
+        let canon = to_canonical_json(decision)?;
         let path = self
             .root
             .join("decisions")
             .join(format!("{}.json", decision.subject));
-        fs::write(&path, json).map_err(|e| format!("write decision failed: {e}"))
+        write_atomic_no_symlink(&path, canon.as_bytes())?;
+        Ok(id)
     }
 
     pub fn load_decision_for_subject(&self, subject: &str) -> Option<Decision> {
-        self.read_from_any("decisions", &format!("{subject}.json"))
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        validate_hex_id(subject).ok()?;
+        for root in self.all_roots() {
+            let p = root.join("decisions").join(format!("{subject}.json"));
+            if reject_symlink(&p).is_err() {
+                continue;
+            }
+            if let Ok(s) = fs::read_to_string(&p) {
+                if let Ok(d) = serde_json::from_str::<Decision>(&s) {
+                    if d.subject == subject {
+                        return Some(d);
+                    }
+                }
+            }
+        }
+        None
     }
 
-    pub fn save_reading_json(&self, reading_key: &str, canonical_json: &str) -> Result<(), String> {
+    pub fn save_reading_json(&self, reading_key: &str, canonical_json: &str) -> Result<PathBuf, String> {
+        validate_hex_id(reading_key)?;
         let path = self.root.join("readings").join(format!("{reading_key}.json"));
-        fs::write(&path, canonical_json).map_err(|e| format!("write reading failed: {e}"))
+        write_atomic_no_symlink(&path, canonical_json.as_bytes())?;
+        Ok(path)
     }
 
     pub fn load_reading_json(&self, reading_key: &str) -> Option<String> {
-        self.read_from_any("readings", &format!("{reading_key}.json"))
-            .and_then(|b| String::from_utf8(b).ok())
+        validate_hex_id(reading_key).ok()?;
+        for root in self.all_roots() {
+            let p = root.join("readings").join(format!("{reading_key}.json"));
+            if reject_symlink(&p).is_err() {
+                continue;
+            }
+            if let Ok(s) = fs::read_to_string(&p) {
+                return Some(s);
+            }
+        }
+        None
     }
 
     pub fn save_approval(&self, approval: &ApprovalRecord) -> Result<PathBuf, String> {
-        let json = to_canonical_json(approval)?;
+        validate_hex_id(&approval.subject)?;
+        validate_hex_id(&approval.ledger_id)?;
+        let canon = to_canonical_json(approval)?;
         let path = self
             .root
             .join("approvals")
             .join(format!("{}.json", approval.subject));
-        fs::write(&path, json).map_err(|e| format!("write approval failed: {e}"))?;
+        write_atomic_no_symlink(&path, canon.as_bytes())?;
         Ok(path)
     }
 
     pub fn find_approval(&self, subject: &str) -> Option<ApprovalRecord> {
-        self.read_from_any("approvals", &format!("{subject}.json"))
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        validate_hex_id(subject).ok()?;
+        for root in self.all_roots() {
+            let p = root.join("approvals").join(format!("{subject}.json"));
+            if reject_symlink(&p).is_err() {
+                continue;
+            }
+            if let Ok(s) = fs::read_to_string(&p) {
+                if let Ok(rec) = serde_json::from_str::<ApprovalRecord>(&s) {
+                    if rec.subject == subject && validate_hex_id(&rec.ledger_id).is_ok() {
+                        return Some(rec);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Finds a unique ledger whose `subject` or `ledger_id` starts with `prefix` (min 8 hex chars).
+    pub fn find_unique_ledger_for_subject(
+        &self,
+        prefix: &str,
+    ) -> Result<(String, TransitionLedger), String> {
+        let p = prefix.trim().to_ascii_lowercase();
+        if p.len() < 8 || !p.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "approval subject '{prefix}' must be at least 8 lowercase hex characters"
+            ));
+        }
+
+        let mut matches: BTreeMap<String, TransitionLedger> = BTreeMap::new();
+        for root in self.all_roots() {
+            let dir = root.join("ledgers");
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for ent in entries.flatten() {
+                let path = ent.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if reject_symlink(&path).is_err() {
+                    continue;
+                }
+                let Ok(s) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(ledger) = serde_json::from_str::<TransitionLedger>(&s) else {
+                    continue;
+                };
+                let ledger_id = path
+                    .file_stem()
+                    .and_then(|st| st.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if ledger.subject.starts_with(&p) || ledger_id.starts_with(&p) {
+                    matches.insert(ledger_id, ledger);
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return Err(format!("no stored transition ledger matches '{prefix}'"));
+        }
+        // Multiple ledgers may share the same subject (e.g. different history depth); verify unique subject.
+        let subjects: BTreeSet<&str> = matches.values().map(|l| l.subject.as_str()).collect();
+        if subjects.len() > 1 {
+            return Err(format!(
+                "prefix '{prefix}' is ambiguous across {} distinct subjects; provide more hex characters",
+                subjects.len()
+            ));
+        }
+        let (lid, ledger) = matches.into_iter().next().unwrap();
+        Ok((lid, ledger))
     }
 
     pub fn save_input_bundle(
@@ -200,35 +319,71 @@ impl RecordStore {
         bundle: &InputBundle,
         files: &[(&str, &[u8])],
     ) -> Result<PathBuf, String> {
-        let dir = self.root.join("inputs").join(ledger_id);
-        fs::create_dir_all(&dir).map_err(|e| format!("create input bundle dir: {e}"))?;
-        for (rel, bytes) in files {
-            fs::write(dir.join(rel), bytes)
-                .map_err(|e| format!("write bundle file {rel}: {e}"))?;
+        validate_hex_id(ledger_id)?;
+        validate_safe_filename(&bundle.new_tarball_file)?;
+        if let Some(ref rf) = bundle.reference_tarball_file {
+            validate_safe_filename(rf)?;
         }
-        let manifest = to_canonical_json(bundle)?;
-        fs::write(dir.join("bundle.json"), manifest)
-            .map_err(|e| format!("write bundle.json: {e}"))?;
+        if let Some(ref rs) = bundle.registry_snapshot_file {
+            validate_safe_filename(rs)?;
+        }
+        let dir = self.root.join("inputs").join(ledger_id);
+        reject_symlink(&dir)?;
+        fs::create_dir_all(&dir).map_err(|e| format!("create bundle dir: {e}"))?;
+        for (name, bytes) in files {
+            validate_safe_filename(name)?;
+            write_atomic_no_symlink(&dir.join(name), bytes)?;
+        }
+        let canon = to_canonical_json(bundle)?;
+        write_atomic_no_symlink(&dir.join("bundle.json"), canon.as_bytes())?;
         Ok(dir)
     }
 
     pub fn load_input_bundle(bundle_dir: &Path) -> Result<InputBundle, String> {
-        let bytes = fs::read(bundle_dir.join("bundle.json"))
-            .map_err(|e| format!("failed reading bundle.json: {e}"))?;
-        serde_json::from_slice(&bytes).map_err(|e| format!("invalid bundle.json: {e}"))
+        let p = bundle_dir.join("bundle.json");
+        reject_symlink(&p)?;
+        let s = fs::read_to_string(&p)
+            .map_err(|e| format!("failed reading {}: {e}", p.display()))?;
+        let bundle: InputBundle =
+            serde_json::from_str(&s).map_err(|e| format!("invalid bundle.json: {e}"))?;
+        validate_safe_filename(&bundle.new_tarball_file)?;
+        if let Some(ref rf) = bundle.reference_tarball_file {
+            validate_safe_filename(rf)?;
+        }
+        if let Some(ref rs) = bundle.registry_snapshot_file {
+            validate_safe_filename(rs)?;
+        }
+        Ok(bundle)
     }
 
-    fn read_from_any(&self, subdir: &str, filename: &str) -> Option<Vec<u8>> {
-        let primary = self.root.join(subdir).join(filename);
-        if let Ok(b) = fs::read(primary) {
-            return Some(b);
-        }
-        for ro in &self.readonly_stores {
-            if let Ok(b) = fs::read(ro.join(subdir).join(filename)) {
-                return Some(b);
+    pub fn list_all_ledgers(&self) -> Vec<(String, TransitionLedger)> {
+        let mut out = Vec::new();
+        for root in self.all_roots() {
+            let dir = root.join("ledgers");
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for ent in entries.flatten() {
+                let path = ent.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if reject_symlink(&path).is_err() {
+                    continue;
+                }
+                if let Ok(s) = fs::read_to_string(&path) {
+                    if let Ok(ledger) = serde_json::from_str::<TransitionLedger>(&s) {
+                        let lid = path
+                            .file_stem()
+                            .and_then(|st| st.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        out.push((lid, ledger));
+                    }
+                }
             }
         }
-        None
+        out
     }
 }
 
@@ -237,28 +392,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn saves_and_finds_approval_across_readonly_stores() {
-        let tmp = std::env::temp_dir().join(format!("assay-store-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp);
-        let shared = tmp.join("shared");
-        let local = tmp.join("local");
+    fn saves_and_finds_approval_across_readonly_stores_and_rejects_traversal() {
+        let base = std::env::temp_dir().join(format!("assay-store-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let ro = base.join("ro");
+        let rw = base.join("rw");
 
-        let shared_store = RecordStore::open(shared.clone(), vec![]).unwrap();
-        let rec = ApprovalRecord {
+        let s_ro = RecordStore::open(ro.clone(), vec![]).unwrap();
+        let approval = ApprovalRecord {
             kind: "approval".into(),
-            schema: 1,
-            subject: "abcdef1234567890".into(),
-            ledger_id: "112233".into(),
-            approved_facts: BTreeSet::from(["break:provenance_lost".into()]),
+            schema: 2,
+            subject: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
+            ledger_id: "1111111111111111111111111111111111111111111111111111111111111111".into(),
+            approved_facts: ["break:provenance_lost".into()].into_iter().collect(),
             approver: "alice".into(),
             approved_at: "2026-11-19T23:00:00Z".into(),
-            note: Some("reviewed".into()),
+            note: Some("verified".into()),
         };
-        shared_store.save_approval(&rec).unwrap();
+        s_ro.save_approval(&approval).unwrap();
 
-        let local_store = RecordStore::open(local, vec![shared]).unwrap();
-        let loaded = local_store.find_approval("abcdef1234567890").unwrap();
-        assert_eq!(loaded, rec);
-        let _ = fs::remove_dir_all(&tmp);
+        let s_rw = RecordStore::open(rw, vec![ro]).unwrap();
+        let found = s_rw.find_approval(&approval.subject).unwrap();
+        assert_eq!(found.approver, "alice");
+        assert!(found.approved_facts.contains("break:provenance_lost"));
+
+        // Path traversal and non-hex IDs must be rejected.
+        assert!(validate_hex_id("../etc/passwd").is_err());
+        assert!(validate_hex_id("abcdef0123456789-model").is_err());
+        assert!(validate_safe_filename("../escape.tgz").is_err());
+        assert!(validate_safe_filename("sub/file.tgz").is_err());
+        assert!(s_rw.find_approval("../../etc/passwd").is_none());
+        assert!(s_rw.save_reading_json("../pwn", "{}").is_err());
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

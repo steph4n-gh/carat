@@ -192,7 +192,8 @@ impl Fetcher {
                     deps.iter().find_map(|d| {
                         d.pointer("/digest/gitCommit")
                             .and_then(|c| c.as_str())
-                            .map(String::from)
+                            .filter(|c| is_hex_commit(c))
+                            .map(|c| c.to_ascii_lowercase())
                     })
                 })?;
 
@@ -320,9 +321,9 @@ impl Fetcher {
         let mut remote_tags: BTreeSet<String> = BTreeSet::new();
         let mut ls_remote_error: Option<String> = None;
         if let Some(ref url) = repo_url {
-            if url.starts_with("https://") {
+            if validate_public_https_git_url(url).is_ok() {
                 methods_tried.push("tag".to_string());
-                match git_ls_remote(url) {
+                match git_ls_remote(&self.cache_dir, url) {
                     Ok(refs) => {
                         for (refname, sha) in &refs {
                             if refname.starts_with("refs/heads/") {
@@ -441,7 +442,7 @@ impl Fetcher {
             || remote_tags.iter().any(|s| s.eq_ignore_ascii_case(&commit));
 
         let fetch_ref = matched_tag_ref.as_deref();
-        let (snapshot, snapshot_err) = match self.fetch_git_source_snapshot(
+        let (snapshot, _snapshot_err) = match self.fetch_git_source_snapshot(
             url,
             &commit,
             fetch_ref,
@@ -476,6 +477,8 @@ impl Fetcher {
             .and_then(|s| s.package_dir.clone())
             .or_else(|| manifest.repository_directory.clone());
 
+        // Only populate `lookup_error` on genuine upstream unreachability (`ls_remote_error`).
+        // A nonexistent attacker-chosen `gitHead` commit against a reachable repo MUST NOT suppress `AnchorLost`.
         let anchor = Anchor {
             found: snapshot.is_some(),
             commit: Some(commit),
@@ -488,7 +491,7 @@ impl Fetcher {
             workflow_path: prov.as_ref().and_then(|p| p.workflow_path.clone()),
             workflow_ref: wf_ref,
             reachable_from_branch,
-            lookup_error: snapshot_err.or(ls_remote_error),
+            lookup_error: ls_remote_error,
         };
 
         (anchor, snapshot)
@@ -606,25 +609,27 @@ impl Fetcher {
         archive: &LoadedArchive,
         ref_archive: Option<&LoadedArchive>,
     ) -> Result<SourceSnapshot, String> {
-        if !repo_url.starts_with("https://") {
-            return Err(format!("refusing non-https git url: {repo_url}"));
+        validate_public_https_git_url(repo_url)?;
+        if !is_hex_commit(commit) {
+            return Err(format!("invalid git commit oid '{commit}'"));
         }
 
         let repo_key = sha256_hex(repo_url.as_bytes());
         let repo_dir = self.cache_dir.join("git").join(&repo_key[..24]);
+        let alternates = repo_dir.join("objects").join("info").join("alternates");
+        if alternates.exists() {
+            return Err("refusing cached git repo with objects/info/alternates".into());
+        }
         if !repo_dir.exists() {
             fs::create_dir_all(&repo_dir).map_err(|e| format!("mkdir git cache: {e}"))?;
-            run_git(
-                &repo_dir,
-                &["init", "--bare", "--quiet"],
-            )?;
-            run_git(&repo_dir, &["remote", "add", "origin", repo_url])?;
-            run_git(&repo_dir, &["config", "remote.origin.promisor", "true"])?;
-            run_git(
-                &repo_dir,
-                &["config", "remote.origin.partialclonefilter", "blob:none"],
-            )?;
+            run_git(&repo_dir, &["init", "--bare", "--quiet"])?;
         }
+        // Always pin a clean bare git config so a planted `.assay/cache/git/<key>/config`
+        // can never inject `url.*.insteadOf`, hooks, filters, or sshCommand.
+        let clean_config = format!(
+            "[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = true\n[extensions]\n\tpartialclone = origin\n[remote \"origin\"]\n\turl = {repo_url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n\tpromisor = true\n\tpartialclonefilter = blob:none\n"
+        );
+        assay_core::store::write_atomic_no_symlink(&repo_dir.join("config"), clean_config.as_bytes())?;
 
         // Check if commit object is already in local bare cache; if not, fetch shallow without blobs.
         let has_commit = run_git(&repo_dir, &["cat-file", "-e", &format!("{commit}^{{commit}}")]).is_ok();
@@ -831,10 +836,16 @@ pub fn build_release_history(
             ..Default::default()
         });
 
+    let new_is_prerelease = new_version.contains('-');
     let mut dated_prior: Vec<(i64, ReleaseMetaSummary)> = Vec::new();
     if let (Some(tm), Some(vm)) = (time_map, versions_map) {
         for (ver, ver_json) in vm {
             if ver == new_version {
+                continue;
+            }
+            // Prevent prerelease flooding (e.g. publishing dummy 1.0.1-alpha.1..3) from poisoning
+            // `repo_changed` / `provenance_lost` baselines for stable releases.
+            if !new_is_prerelease && ver.contains('-') {
                 continue;
             }
             let Some(ts_str) = tm.get(ver).and_then(|v| v.as_str()) else {
@@ -928,6 +939,7 @@ fn encode_npm_name(name: &str) -> String {
 fn curl_get(url: &str, extra_headers: &[&str], allow_redirects: bool) -> Result<Vec<u8>, String> {
     let mut cmd = Command::new("curl");
     cmd.args([
+        "-q",
         "--silent",
         "--show-error",
         "--fail",
@@ -948,6 +960,7 @@ fn curl_get(url: &str, extra_headers: &[&str], allow_redirects: bool) -> Result<
     for h in extra_headers {
         cmd.args(["-H", h]);
     }
+    cmd.arg("--");
     cmd.arg(url);
 
     let out = cmd.output().map_err(|e| format!("failed to run curl: {e}"))?;
@@ -961,6 +974,7 @@ fn curl_get(url: &str, extra_headers: &[&str], allow_redirects: bool) -> Result<
 fn curl_post_json(url: &str, body: &str) -> Result<Vec<u8>, String> {
     let mut child = Command::new("curl")
         .args([
+            "-q",
             "--silent",
             "--show-error",
             "--fail",
@@ -974,6 +988,7 @@ fn curl_post_json(url: &str, body: &str) -> Result<Vec<u8>, String> {
             "Content-Type: application/json",
             "--data-binary",
             "@-",
+            "--",
             url,
         ])
         .stdin(Stdio::piped())
@@ -997,6 +1012,68 @@ fn curl_post_json(url: &str, body: &str) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
+/// Validates that a repository URL is a public HTTPS Git URL with no SSRF/local targets or flag injection.
+fn validate_public_https_git_url(url: &str) -> Result<(), String> {
+    if url.starts_with('-') || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!("refusing unsafe git url: {url}"));
+    }
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("refusing non-https git url: {url}"))?;
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(format!("refusing git url with credentials or empty host: {url}"));
+    }
+    let host_raw = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed
+            .split(']')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    } else {
+        authority
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    if host_raw.is_empty()
+        || host_raw == "localhost"
+        || host_raw.ends_with(".localhost")
+        || host_raw.ends_with(".local")
+        || host_raw.ends_with(".internal")
+        || host_raw == "::1"
+        || host_raw.starts_with("fe80:")
+        || host_raw.starts_with("fc")
+        || host_raw.starts_with("fd")
+    {
+        return Err(format!("refusing local/private git host: {host_raw}"));
+    }
+    if let Ok(ip) = host_raw.parse::<std::net::IpAddr>() {
+        let forbidden = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+                    || v4.is_documentation()
+                    || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64)
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+        if forbidden {
+            return Err(format!("refusing private/loopback git ip: {host_raw}"));
+        }
+    }
+    Ok(())
+}
+
 fn hardened_git_cmd(cwd: Option<&Path>) -> Command {
     let mut cmd = Command::new("git");
     if let Some(dir) = cwd {
@@ -1007,13 +1084,23 @@ fn hardened_git_cmd(cwd: Option<&Path>) -> Command {
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
     cmd.args([
         "-c",
+        "safe.bareRepository=explicit",
+        "-c",
         "core.hooksPath=/dev/null",
         "-c",
         "core.symlinks=false",
         "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.sshCommand=false",
+        "-c",
+        "credential.helper=",
+        "-c",
         "submodule.recurse=false",
         "-c",
         "protocol.file.allow=never",
+        "-c",
+        "protocol.ext.allow=never",
         "-c",
         "filter.lfs.smudge=",
         "-c",
@@ -1023,7 +1110,12 @@ fn hardened_git_cmd(cwd: Option<&Path>) -> Command {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = hardened_git_cmd(Some(cwd))
+    let mut cmd = hardened_git_cmd(Some(cwd));
+    // Explicitly pass GIT_DIR for bare cache repos (except during `init`) so `safe.bareRepository=explicit` works cleanly.
+    if args.first().copied() != Some("init") {
+        cmd.env("GIT_DIR", cwd);
+    }
+    let out = cmd
         .args(args)
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
@@ -1034,9 +1126,13 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
-fn git_ls_remote(repo_url: &str) -> Result<BTreeMap<String, String>, String> {
-    let out = hardened_git_cmd(None)
-        .args(["ls-remote", "--tags", "--heads", repo_url])
+fn git_ls_remote(neutral_dir: &Path, repo_url: &str) -> Result<BTreeMap<String, String>, String> {
+    validate_public_https_git_url(repo_url)?;
+    // Run inside neutral cache directory (never process CWD) with GIT_CEILING_DIRECTORIES so an
+    // untrusted checkout's `.git/config` cannot inject `url.*.insteadOf` or `credential.helper`.
+    let out = hardened_git_cmd(Some(neutral_dir))
+        .env("GIT_CEILING_DIRECTORIES", neutral_dir)
+        .args(["ls-remote", "--tags", "--heads", "--", repo_url])
         .output()
         .map_err(|e| format!("failed to spawn git ls-remote: {e}"))?;
     if !out.status.success() {
@@ -1112,6 +1208,7 @@ fn read_git_blobs_batch(
     sha1s: &[String],
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut child = hardened_git_cmd(Some(repo_dir))
+        .env("GIT_DIR", repo_dir)
         .args(["cat-file", "--batch"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

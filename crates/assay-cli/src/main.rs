@@ -8,10 +8,11 @@ mod render;
 use assay_core::archive::{LoadedArchive, extract_manifest_facts, inspect_tgz, strip_archive_root};
 use assay_core::canonical::{canonical_id, format_unix_rfc3339, to_canonical_json};
 use assay_core::config::AssayConfig;
-use assay_core::digest::sha256_hex;
+use assay_core::digest::{parse_sha512_sri, sha256_hex};
 use assay_core::history::HistoryContext;
 use assay_core::lockfile::{
-    LockTransition, deduplicate_transitions, diff_lockfiles, parse_lockfile_packages,
+    LockTransition, deduplicate_transitions, diff_lockfiles, parent_node_modules_instance,
+    parse_lockfile_packages,
 };
 use assay_core::model::{
     ArchiveLimits, LockAlarm, ReadingOutcome, ReferenceStanding, StopRule, Verdict,
@@ -21,16 +22,19 @@ use assay_core::packet::{PacketBudgets, build_inline_residual_diffs, build_readi
 use assay_core::policy::{
     TransitionInput, build_artifact_profile, build_transition_ledger, evaluate_decision,
 };
-use assay_core::reader::ReadingRecord;
+use assay_core::reader::{ReadingRecord, instruction_hash};
 use assay_core::source::SourceSnapshot;
-use assay_core::store::{ApprovalRecord, InputBundle, RecordStore};
+use assay_core::store::{
+    ApprovalRecord, InputBundle, RecordStore, reject_symlink, validate_safe_filename,
+    write_atomic_no_symlink,
+};
 use clap::{Parser, Subcommand};
 use exposure::{ExposureQuery, search_git_lockfile_exposure, search_store_exposure};
 use fetch::{Fetcher, build_release_history};
 use mcp::{McpDispatcher, run_mcp_server};
 use pr::{
-    PrComment, detect_protected_file_tampering, list_changed_paths, parse_approval_comments,
-    read_git_file,
+    PrComment, detect_protected_file_tampering, git_merge_base, list_changed_paths,
+    parse_approval_comments, read_git_file,
 };
 use reader_exec::{ReaderExecConfig, run_reading};
 use render::{TransitionReportItem, render_change_summary, render_explain_markdown};
@@ -118,6 +122,9 @@ enum Commands {
         /// PR author username (prevented from self-approving)
         #[arg(long)]
         pr_author: Option<String>,
+        /// Optional path to write the Markdown summary alongside `--json` in a single evaluation
+        #[arg(long)]
+        markdown_out: Option<PathBuf>,
         #[arg(long)]
         read: bool,
     },
@@ -257,6 +264,7 @@ fn main() -> ExitCode {
             manifest,
             comments_json,
             pr_author,
+            markdown_out,
             read,
         } => match run_pr(
             &repo,
@@ -266,6 +274,7 @@ fn main() -> ExitCode {
             &manifest,
             comments_json.as_deref(),
             pr_author.as_deref(),
+            markdown_out.as_deref(),
             read,
             &store_root,
             cli.json,
@@ -377,6 +386,12 @@ fn main() -> ExitCode {
     }
 }
 
+fn allow_untrusted_reader_command() -> bool {
+    std::env::var("ASSAY_ALLOW_READER_COMMAND")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn load_config(explicit: Option<&Path>) -> Result<AssayConfig, String> {
     if let Some(p) = explicit {
         let s = fs::read_to_string(p)
@@ -386,12 +401,198 @@ fn load_config(explicit: Option<&Path>) -> Result<AssayConfig, String> {
     for candidate in ["assay.toml", ".assay.toml"] {
         let p = Path::new(candidate);
         if p.exists() {
+            reject_symlink(p)?;
             let s = fs::read_to_string(p)
                 .map_err(|e| format!("failed reading {}: {e}", p.display()))?;
-            return AssayConfig::from_toml(&s);
+            let cfg = AssayConfig::from_toml(&s)?;
+            if cfg.reader.command.is_some() && !allow_untrusted_reader_command() {
+                return Err(format!(
+                    "refusing reader.command from auto-discovered {} (pass --config {} explicitly or set ASSAY_ALLOW_READER_COMMAND=1)",
+                    p.display(),
+                    p.display()
+                ));
+            }
+            if !cfg.stores.is_empty() {
+                return Err(format!(
+                    "refusing external `stores` from auto-discovered {} (pass --config {} explicitly)",
+                    p.display(),
+                    p.display()
+                ));
+            }
+            return Ok(cfg);
         }
     }
     Ok(AssayConfig::default())
+}
+
+/// Strictly validates a package specifier passed to `assay add` before invoking `npm`.
+/// Prevents CLI flag injection (`--ignore-scripts=false`, `--registry=...`) and non-registry URL/path specs.
+fn validate_npm_package_spec(package: &str) -> Result<(), String> {
+    if package.is_empty() || package.len() > 256 {
+        return Err(format!("invalid package specifier '{package}'"));
+    }
+    if package.starts_with('-') {
+        return Err(format!(
+            "refusing package specifier starting with '-': '{package}'"
+        ));
+    }
+    if package.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "refusing package specifier with whitespace/control characters: '{package}'"
+        ));
+    }
+    let lower = package.to_ascii_lowercase();
+    if lower.contains("://")
+        || lower.starts_with("file:")
+        || lower.starts_with("git+")
+        || lower.starts_with("github:")
+        || lower.starts_with("gitlab:")
+        || lower.starts_with("bitbucket:")
+        || lower.starts_with("npm:")
+        || package.starts_with('.')
+        || package.starts_with('/')
+        || package.starts_with('~')
+        || package.contains('\\')
+    {
+        return Err(format!(
+            "refusing non-registry package specifier '{package}' (expected <name> or <name>@<version>)"
+        ));
+    }
+
+    let (pkg_name, ver_opt) = if let Some(rest) = package.strip_prefix('@') {
+        let Some(slash) = rest.find('/') else {
+            return Err(format!("invalid scoped package specifier '{package}'"));
+        };
+        let after_slash = &rest[slash + 1..];
+        match after_slash.find('@') {
+            Some(at) => (&package[..1 + slash + 1 + at], Some(&after_slash[at + 1..])),
+            None => (package, None),
+        }
+    } else {
+        match package.find('@') {
+            Some(at) => (&package[..at], Some(&package[at + 1..])),
+            None => (package, None),
+        }
+    };
+
+    if pkg_name.is_empty() || pkg_name.contains("..") {
+        return Err(format!("invalid package name in '{package}'"));
+    }
+    let valid_name_seg = |seg: &str| {
+        !seg.is_empty()
+            && !seg.starts_with('.')
+            && !seg.starts_with('_')
+            && seg
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    if let Some(scoped) = pkg_name.strip_prefix('@') {
+        let Some((scope, name)) = scoped.split_once('/') else {
+            return Err(format!("invalid scoped package name '{pkg_name}'"));
+        };
+        if !valid_name_seg(scope) || !valid_name_seg(name) || name.contains('/') {
+            return Err(format!("invalid scoped package name '{pkg_name}'"));
+        }
+    } else if !valid_name_seg(pkg_name) || pkg_name.contains('/') {
+        return Err(format!("invalid package name '{pkg_name}'"));
+    }
+
+    if let Some(ver) = ver_opt {
+        if ver.is_empty()
+            || !ver.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(b, b'.' | b'-' | b'_' | b'+' | b'^' | b'~' | b'*' | b'=' | b'<' | b'>')
+            })
+        {
+            return Err(format!("invalid version specifier '{ver}' in '{package}'"));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects project `.npmrc` files containing executable/security-sensitive directives.
+fn validate_project_npmrc(npmrc_path: &Path) -> Result<(), String> {
+    if !npmrc_path.exists() {
+        return Ok(());
+    }
+    reject_symlink(npmrc_path)?;
+    let content =
+        fs::read_to_string(npmrc_path).map_err(|e| format!("read .npmrc: {e}"))?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        let key = trimmed
+            .split('=')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if matches!(
+            key.as_str(),
+            "git"
+                | "script-shell"
+                | "onload-script"
+                | "node-gyp"
+                | "cafile"
+                | "ignore-scripts"
+                | "allow-git"
+                | "browser"
+                | "editor"
+        ) {
+            return Err(format!(
+                "refusing .npmrc directive '{key}' in {} (security-sensitive npm config)",
+                npmrc_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn create_private_temp_dir(prefix: &str) -> Result<TempDirGuard, String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|e| format!("create private temp dir: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::DirBuilder::new()
+            .create(&path)
+            .map_err(|e| format!("create temp dir: {e}"))?;
+    }
+    Ok(TempDirGuard(path))
+}
+
+fn scrubbed_npm_command(dir: &Path) -> Command {
+    let mut cmd = Command::new("npm");
+    cmd.current_dir(dir);
+    for (k, _) in std::env::vars() {
+        if k.to_ascii_lowercase().starts_with("npm_config_") {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd.env("npm_config_ignore_scripts", "true");
+    cmd.env("npm_config_git", "/usr/bin/false");
+    cmd.env("npm_config_script_shell", "/usr/bin/false");
+    cmd
 }
 
 fn open_store(store_root: &Path, cfg: &AssayConfig) -> Result<RecordStore, String> {
@@ -430,6 +631,7 @@ struct EvalOptions<'a> {
     save_inputs: bool,
     is_new_direct: bool,
     is_new_to_project: bool,
+    allow_store_approvals: bool,
     lock_alarms: BTreeSet<LockAlarm>,
     pr_approvals: &'a [pr::ParsedPrApproval],
 }
@@ -480,17 +682,33 @@ fn evaluate_single_transition(
 
     if let Some(ref rv) = chosen_ref_ver {
         if let Some(ref_reg) = versions.get(rv) {
+            let reg_ref_url = ref_reg.pointer("/dist/tarball").and_then(|v| v.as_str());
+            let reg_ref_int = ref_reg.pointer("/dist/integrity").and_then(|v| v.as_str());
             let (rt_url, rt_int) = match ref_tarball_opt {
-                Some((u, i)) => (u, i),
+                Some((u, i)) => {
+                    if let Some(expected_url) = reg_ref_url {
+                        if u != expected_url {
+                            return Err(format!(
+                                "lockfile reference resolved URL '{u}' disagrees with registry tarball '{expected_url}' for {name}@{rv}"
+                            ));
+                        }
+                    }
+                    (u, i)
+                }
                 None => (
-                    ref_reg
-                        .pointer("/dist/tarball")
-                        .and_then(|v| v.as_str())
+                    reg_ref_url
                         .ok_or_else(|| format!("missing dist.tarball for {name}@{rv}"))?,
-                    ref_reg.pointer("/dist/integrity").and_then(|v| v.as_str()),
+                    reg_ref_int,
                 ),
             };
             let ra = fetcher.fetch_and_inspect_tarball(rt_url, rt_int, limits)?;
+            if let Some(expected_sha512) = reg_ref_int.and_then(parse_sha512_sri) {
+                if !ra.inventory.sha512.eq_ignore_ascii_case(&expected_sha512) {
+                    return Err(format!(
+                        "reference tarball sha512 disagrees with registry integrity for {name}@{rv}"
+                    ));
+                }
+            }
             let rm = extract_manifest_facts(&ra);
             let (r_anchor, r_source) =
                 fetcher.resolve_anchor_and_source(name, rv, &ra, &rm, ref_reg, None);
@@ -510,17 +728,38 @@ fn evaluate_single_transition(
         }
     }
 
+    let reg_new_url = new_reg.pointer("/dist/tarball").and_then(|v| v.as_str());
+    let reg_new_int = new_reg.pointer("/dist/integrity").and_then(|v| v.as_str());
     let (nt_url, nt_int) = match new_tarball_opt {
-        Some((u, i)) => (u, i),
+        Some((u, i)) => {
+            // Prevent lockfile name/version vs resolved URL spoofing (which would apply
+            // a benign package's OSV/age/history to an unrelated malicious tarball).
+            if let Some(expected_url) = reg_new_url {
+                if u != expected_url {
+                    return Err(format!(
+                        "lockfile resolved URL '{u}' disagrees with registry dist.tarball '{expected_url}' for {name}@{new_ver}"
+                    ));
+                }
+            }
+            (u, i)
+        }
         None => (
-            new_reg
-                .pointer("/dist/tarball")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("missing dist.tarball for {name}@{new_ver}"))?,
-            new_reg.pointer("/dist/integrity").and_then(|v| v.as_str()),
+            reg_new_url.ok_or_else(|| format!("missing dist.tarball for {name}@{new_ver}"))?,
+            reg_new_int,
         ),
     };
     let new_archive = fetcher.fetch_and_inspect_tarball(nt_url, nt_int, limits)?;
+    if let Some(expected_sha512) = reg_new_int.and_then(parse_sha512_sri) {
+        if !new_archive
+            .inventory
+            .sha512
+            .eq_ignore_ascii_case(&expected_sha512)
+        {
+            return Err(format!(
+                "lockfile tarball sha512 disagrees with registry dist.integrity for {name}@{new_ver}"
+            ));
+        }
+    }
     let new_manifest = extract_manifest_facts(&new_archive);
     let (new_anchor, new_source) = fetcher.resolve_anchor_and_source(
         name,
@@ -545,7 +784,7 @@ fn evaluate_single_transition(
     let reg_manifest_diffs = new_archive
         .contents
         .iter()
-        .find(|(p, _)| strip_archive_root(p) == "package.json")
+        .find(|(p, _)| strip_archive_root(p).eq_ignore_ascii_case("package.json"))
         .map(|(_, bytes)| registry_manifest_differs(bytes, new_reg, new_manifest.has_binding_gyp))
         .unwrap_or_default();
 
@@ -680,46 +919,57 @@ fn evaluate_single_transition(
                 .all(|&r| r == StopRule::S8 || r == StopRule::S9));
 
     if should_read {
-        let reading_cache_key = format!(
-            "{}-{}",
-            &ledger_id[..24],
-            cfg.reader.model.replace('/', "_")
-        );
-        // Only reuse cached COMPLETED assessments (never reuse cached Unavailable / Invalid outages!).
+        let (commit_subjects, source_diff) = match (
+            new_anchor.repository_url.as_deref(),
+            ref_anchor_commit.as_deref(),
+            new_anchor.commit.as_deref(),
+        ) {
+            (Some(url), Some(fc), Some(tc)) => fetcher.fetch_commit_subjects_and_source_diff(
+                url,
+                fc,
+                tc,
+                new_anchor.repository_directory.as_deref(),
+            ),
+            _ => (Vec::new(), None),
+        };
+        let packet = build_reading_packet(
+            &ledger,
+            ref_archive.as_ref(),
+            &new_archive,
+            commit_subjects,
+            source_diff,
+            PacketBudgets::default(),
+        )?;
+
+        let expected_instruction_hash = instruction_hash();
+        let cache_key_payload = json!({
+            "ledger_id": ledger_id,
+            "packet_hash": packet.packet_hash,
+            "instruction_hash": expected_instruction_hash,
+            "model": cfg.reader.model,
+            "effort": cfg.reader.effort,
+            "command": cfg.reader.command,
+        });
+        let reading_cache_key = sha256_hex(to_canonical_json(&cache_key_payload)?.as_bytes());
+
+        // Only reuse cached COMPLETED assessments that match the exact ledger, packet, prompt, and model.
         if let Some(cached_json) = store.load_reading_json(&reading_cache_key) {
             if let Ok(rec) = serde_json::from_str::<ReadingRecord>(&cached_json) {
-                if matches!(
-                    rec.outcome,
-                    ReadingOutcome::Passed | ReadingOutcome::Concern | ReadingOutcome::Refused
-                ) {
+                if rec.ledger_id == ledger_id
+                    && rec.packet_hash == packet.packet_hash
+                    && rec.instruction_hash == expected_instruction_hash
+                    && rec.model == cfg.reader.model
+                    && matches!(
+                        rec.outcome,
+                        ReadingOutcome::Passed | ReadingOutcome::Concern | ReadingOutcome::Refused
+                    )
+                {
                     reading_outcome = rec.outcome;
                     reading_record = Some(rec);
                 }
             }
         }
         if reading_record.is_none() {
-            let (commit_subjects, source_diff) = match (
-                new_anchor.repository_url.as_deref(),
-                ref_anchor_commit.as_deref(),
-                new_anchor.commit.as_deref(),
-            ) {
-                (Some(url), Some(fc), Some(tc)) => fetcher.fetch_commit_subjects_and_source_diff(
-                    url,
-                    fc,
-                    tc,
-                    new_anchor.repository_directory.as_deref(),
-                ),
-                _ => (Vec::new(), None),
-            };
-            let packet = build_reading_packet(
-                &ledger,
-                ref_archive.as_ref(),
-                &new_archive,
-                commit_subjects,
-                source_diff,
-                PacketBudgets::default(),
-            )?;
-
             let exec_cfg = ReaderExecConfig {
                 command: cfg.reader.command.clone(),
                 model: cfg.reader.model.clone(),
@@ -741,12 +991,17 @@ fn evaluate_single_transition(
         }
     }
 
-    // Check granular approval in store (exact approved_facts) or PR comments.
-    let store_approval = store.find_approval(&ledger.subject);
+    // Check granular approval in store (disabled during `assay pr` so working-tree `.assay/approvals` cannot forge PR approvals)
+    // or PR comments bound strictly to exact `ledger_id` (enforcing S10 staleness across lock/break/advisory changes).
+    let store_approval = if opts.allow_store_approvals {
+        store.find_approval(&ledger.subject)
+    } else {
+        None
+    };
     let pr_approval = opts
         .pr_approvals
         .iter()
-        .find(|a| ledger.subject.starts_with(&a.subject));
+        .find(|a| ledger_id.starts_with(&a.subject));
 
     let prior_facts = store_approval.as_ref().map(|a| &a.approved_facts);
     let decision = evaluate_decision(
@@ -765,8 +1020,8 @@ fn evaluate_single_transition(
             if let Some(ref sa) = store_approval {
                 Some(sa.approver.clone())
             } else {
-                // PR comment approval: disallow silently approving known_malicious advisories without explicit store record
-                if ledger.advisory_ids.is_empty() {
+                // PR comment approval: bound to exact ledger_id; disallow approving known_malicious or Reader Concern via comment alone.
+                if ledger.advisory_ids.is_empty() && reading_outcome != ReadingOutcome::Concern {
                     pr_approval.map(|pa| pa.approver.clone())
                 } else {
                     None
@@ -818,6 +1073,7 @@ fn run_explain(
             save_inputs,
             is_new_direct: false,
             is_new_to_project: false,
+            allow_store_approvals: true,
             lock_alarms: BTreeSet::new(),
             pr_approvals: &[],
         },
@@ -852,8 +1108,14 @@ fn run_check_bytes(
     cfg: &AssayConfig,
     tampered_files: &[String],
     pr_approvals: &[pr::ParsedPrApproval],
+    allow_store_approvals: bool,
 ) -> Result<(Vec<TransitionReportItem>, Vec<String>, bool), String> {
     let diff = diff_lockfiles(base_lock, head_lock, base_pkg, head_pkg)?;
+    let head_pkgs = parse_lockfile_packages(head_lock)?;
+    let head_pkg_map: BTreeMap<&str, &assay_core::lockfile::LockPackage> = head_pkgs
+        .iter()
+        .map(|p| (p.instance_path.as_str(), p))
+        .collect();
     let unique = deduplicate_transitions(&diff.transitions);
     let fetcher = Fetcher::new(store_root.join("cache"))?;
     let store = open_store(store_root, cfg)?;
@@ -862,11 +1124,42 @@ fn run_check_bytes(
     let mut transition_errors = Vec::new();
     for (t, _paths) in unique {
         if t.in_bundle && t.new_resolved.is_none() {
-            continue;
+            // Only skip an `inBundle` entry if we verify its parent package archive actually
+            // declares this dependency as bundled AND physically carries `node_modules/<name>/` inside the parent tarball!
+            match verify_bundled_in_parent(&fetcher, &t, &head_pkg_map) {
+                Ok(true) => continue,
+                Ok(false) => {
+                    transition_errors.push(format!(
+                        "{}@{} ({}): forged or unverified inBundle entry (parent archive does not bundle this package)",
+                        t.name,
+                        t.new_version.as_deref().unwrap_or("?"),
+                        t.instance_path
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    transition_errors.push(format!(
+                        "{}@{} ({}): failed verifying inBundle parent: {e}",
+                        t.name,
+                        t.new_version.as_deref().unwrap_or("?"),
+                        t.instance_path
+                    ));
+                    continue;
+                }
+            }
         }
         // Per-transition isolation: one unfetchable/private/non-registry package stops that transition
         // instead of crashing the entire check with exit 2.
-        match eval_lock_transition(&fetcher, &store, cfg, &t, read, as_of, pr_approvals) {
+        match eval_lock_transition(
+            &fetcher,
+            &store,
+            cfg,
+            &t,
+            read,
+            as_of,
+            pr_approvals,
+            allow_store_approvals,
+        ) {
             Ok(item) => items.push(item),
             Err(e) => transition_errors.push(format!(
                 "{}@{} ({}): {e}",
@@ -885,6 +1178,36 @@ fn run_check_bytes(
     Ok((items, transition_errors, all_passed))
 }
 
+/// Verifies that a nested `inBundle: true` lockfile entry is genuinely bundled inside its parent tarball.
+fn verify_bundled_in_parent(
+    fetcher: &Fetcher,
+    t: &LockTransition,
+    head_pkg_map: &BTreeMap<&str, &assay_core::lockfile::LockPackage>,
+) -> Result<bool, String> {
+    let Some(parent_path) = parent_node_modules_instance(&t.instance_path) else {
+        return Ok(false);
+    };
+    let Some(parent_pkg) = head_pkg_map.get(parent_path.as_str()) else {
+        return Ok(false);
+    };
+    let Some(parent_url) = parent_pkg.resolved.as_deref() else {
+        return Ok(false);
+    };
+    let parent_arch = fetcher.fetch_and_inspect_tarball(
+        parent_url,
+        parent_pkg.integrity.as_deref(),
+        ArchiveLimits::default(),
+    )?;
+    let parent_manifest = extract_manifest_facts(&parent_arch);
+    let declared = parent_manifest.bundled_dependencies.contains(&t.name);
+    let expected_prefix = format!("node_modules/{}/", t.name.to_ascii_lowercase());
+    let physically_present = parent_arch.contents.keys().any(|p| {
+        let rel = strip_archive_root(p).to_ascii_lowercase();
+        rel.starts_with(&expected_prefix)
+    });
+    Ok(declared && physically_present)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eval_lock_transition(
     fetcher: &Fetcher,
@@ -894,6 +1217,7 @@ fn eval_lock_transition(
     read: bool,
     as_of: &str,
     pr_approvals: &[pr::ParsedPrApproval],
+    allow_store_approvals: bool,
 ) -> Result<TransitionReportItem, String> {
     let new_ver = t
         .new_version
@@ -924,6 +1248,7 @@ fn eval_lock_transition(
             save_inputs: false,
             is_new_direct: t.is_new_direct,
             is_new_to_project: t.ref_version.is_none(),
+            allow_store_approvals,
             lock_alarms: t.lock_alarms.clone(),
             pr_approvals,
         },
@@ -961,6 +1286,7 @@ fn run_check_files(
         cfg,
         &[],
         &[],
+        true,
     )?;
 
     emit_change_report(&items, &[], &transition_errors, passed, json_output)?;
@@ -1020,12 +1346,16 @@ fn run_pr(
     manifest: &str,
     comments_json: Option<&Path>,
     pr_author: Option<&str>,
+    markdown_out: Option<&Path>,
     read: bool,
     store_root: &Path,
     json_output: bool,
 ) -> Result<bool, String> {
     let as_of = now_rfc3339();
-    let changed_paths = list_changed_paths(repo, base, head)?;
+    // Compute merge-base so un-rebased PRs are diffed cleanly against their fork point,
+    // while policy (`assay.toml`) ALWAYS comes strictly from the protected `base` tip (SPEC 8 & 10.3).
+    let diff_base = git_merge_base(repo, base, head).unwrap_or_else(|_| base.to_string());
+    let changed_paths = list_changed_paths(repo, &diff_base, head)?;
     let mut tampered = detect_protected_file_tampering(&changed_paths);
 
     // Policy MUST come strictly from protected base revision (SPEC 8 & 10.3).
@@ -1035,7 +1365,18 @@ fn run_pr(
         Some(bytes) => {
             let s = String::from_utf8(bytes)
                 .map_err(|_| "base assay.toml is not valid UTF-8".to_string())?;
-            AssayConfig::from_toml(&s)?
+            let cfg = AssayConfig::from_toml(&s)?;
+            if cfg.reader.command.is_some() && !allow_untrusted_reader_command() {
+                return Err(
+                    "refusing reader.command from repository assay.toml during `assay pr` (set ASSAY_ALLOW_READER_COMMAND=1 to opt in)".into(),
+                );
+            }
+            if !cfg.stores.is_empty() {
+                return Err(
+                    "refusing external `stores` from repository assay.toml during `assay pr`".into(),
+                );
+            }
+            cfg
         }
         None => AssayConfig::default(),
     };
@@ -1051,25 +1392,50 @@ fn run_pr(
         _ => Vec::new(),
     };
 
-    let base_lock_opt = read_git_file(repo, base, lockfile)?;
-    let head_lock_opt = read_git_file(repo, head, lockfile)?;
+    let emit = |items: &[TransitionReportItem],
+                tampered_files: &[String],
+                transition_errors: &[String],
+                passed: bool|
+     -> Result<(), String> {
+        if let Some(md_path) = markdown_out {
+            let md = render_change_summary(items, tampered_files, transition_errors);
+            write_atomic_no_symlink(md_path, md.as_bytes())?;
+        }
+        emit_change_report(items, tampered_files, transition_errors, passed, json_output)
+    };
 
-    // Security fix: deleting the lockfile in a PR MUST hard-stop rather than silently passing!
+    // Refuse npm-shrinkwrap.json at PR head because npm ci prioritizes it over package-lock.json.
+    if read_git_file(repo, head, "npm-shrinkwrap.json")?.is_some() {
+        tampered.push("npm-shrinkwrap.json (unsupported lockfile takes precedence over package-lock.json)".into());
+    }
+
+    let base_lock_opt = read_git_file(repo, &diff_base, lockfile)?;
+    let head_lock_opt = read_git_file(repo, head, lockfile)?;
+    let base_pkg = read_git_file(repo, &diff_base, manifest)?;
+    let head_pkg = read_git_file(repo, head, manifest)?;
+
+    // Deleting the lockfile in a PR MUST hard-stop rather than silently passing.
     if base_lock_opt.is_some() && head_lock_opt.is_none() {
         tampered.push(format!("{lockfile} (deleted in PR)"));
-        emit_change_report(&[], &tampered, &[], false, json_output)?;
+        emit(&[], &tampered, &[], false)?;
         return Ok(false);
     }
 
     let Some(head_lock) = head_lock_opt else {
-        emit_change_report(&[], &tampered, &[], tampered.is_empty(), json_output)?;
-        return Ok(tampered.is_empty());
+        // If package.json added/changed dependencies with no lockfile present, fail closed!
+        if head_pkg != base_pkg && package_json_has_dependencies(head_pkg.as_deref()) {
+            tampered.push(format!(
+                "{manifest} changed dependencies without {lockfile}"
+            ));
+        }
+        let ok = tampered.is_empty();
+        emit(&[], &tampered, &[], ok)?;
+        return Ok(ok);
     };
     let base_lock =
         base_lock_opt.unwrap_or_else(|| br#"{"lockfileVersion":3,"packages":{"":{}}}"#.to_vec());
-    let base_pkg = read_git_file(repo, base, manifest)?;
-    let head_pkg = read_git_file(repo, head, manifest)?;
 
+    // Never trust working-tree `.assay/approvals/` during `assay pr` (only verified PR comment approvals apply).
     let (items, transition_errors, passed) = run_check_bytes(
         &base_lock,
         &head_lock,
@@ -1081,10 +1447,31 @@ fn run_pr(
         &base_cfg,
         &tampered,
         &pr_approvals,
+        false,
     )?;
 
-    emit_change_report(&items, &tampered, &transition_errors, passed, json_output)?;
+    emit(&items, &tampered, &transition_errors, passed)?;
     Ok(passed)
+}
+
+fn package_json_has_dependencies(pkg_bytes: Option<&[u8]>) -> bool {
+    let Some(bytes) = pkg_bytes else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_slice::<Value>(assay_core::archive::strip_utf8_bom(bytes)) else {
+        return true;
+    };
+    for sec in ["dependencies", "devDependencies", "optionalDependencies"] {
+        if val
+            .get(sec)
+            .and_then(|v| v.as_object())
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 struct AddResult {
@@ -1103,16 +1490,22 @@ fn execute_add(
     store_root: &Path,
     cfg: &AssayConfig,
 ) -> Result<AddResult, String> {
+    validate_npm_package_spec(package)?;
     let as_of = now_rfc3339();
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp_dir = std::env::temp_dir().join(format!("assay-add-{}-{nonce}", std::process::id()));
-    fs::create_dir_all(&tmp_dir).map_err(|e| format!("create temp dir: {e}"))?;
+
+    if project_dir.join("npm-shrinkwrap.json").exists() {
+        return Err(
+            "refusing to run `assay add` when npm-shrinkwrap.json exists (npm ci prioritizes shrinkwrap over package-lock.json)".into(),
+        );
+    }
 
     let base_pkg_path = project_dir.join("package.json");
     let base_lock_path = project_dir.join("package-lock.json");
+    let npmrc_path = project_dir.join(".npmrc");
+    reject_symlink(&base_pkg_path)?;
+    reject_symlink(&base_lock_path)?;
+    validate_project_npmrc(&npmrc_path)?;
+
     let had_base_pkg = base_pkg_path.exists();
     let had_base_lock = base_lock_path.exists();
 
@@ -1121,6 +1514,16 @@ fn execute_add(
     } else {
         br#"{"name":"assay-project","version":"0.0.0","private":true}"#.to_vec()
     };
+    if let Ok(pkg_val) =
+        serde_json::from_slice::<Value>(assay_core::archive::strip_utf8_bom(&base_pkg_bytes))
+    {
+        if pkg_val.get("workspaces").is_some() {
+            return Err(
+                "`assay add` does not yet support npm workspaces (use `assay check` on workspace lockfile diffs)".into(),
+            );
+        }
+    }
+
     let base_lock_bytes = if had_base_lock {
         fs::read(&base_lock_path).map_err(|e| format!("read package-lock.json: {e}"))?
     } else {
@@ -1130,10 +1533,14 @@ fn execute_add(
     let base_pkg_hash = sha256_hex(&base_pkg_bytes);
     let base_lock_hash = sha256_hex(&base_lock_bytes);
 
-    // Copy .npmrc if present so private/custom registry configs are surfaced honestly rather than silently dropped.
-    if project_dir.join(".npmrc").exists() {
-        let _ = fs::copy(project_dir.join(".npmrc"), tmp_dir.join(".npmrc"));
-    }
+    let tmp_guard = create_private_temp_dir("assay-add")?;
+    let tmp_dir = &tmp_guard.0;
+    let empty_user_rc = tmp_dir.join(".assay-empty-user.npmrc");
+    let empty_global_rc = tmp_dir.join(".assay-empty-global.npmrc");
+    fs::write(&empty_user_rc, b"").map_err(|e| format!("write temp user npmrc: {e}"))?;
+    fs::write(&empty_global_rc, b"").map_err(|e| format!("write temp global npmrc: {e}"))?;
+    let user_rc_arg = format!("--userconfig={}", empty_user_rc.display());
+    let global_rc_arg = format!("--globalconfig={}", empty_global_rc.display());
 
     fs::write(tmp_dir.join("package.json"), &base_pkg_bytes)
         .map_err(|e| format!("write temp package.json: {e}"))?;
@@ -1142,15 +1549,17 @@ fn execute_add(
             .map_err(|e| format!("write temp package-lock.json: {e}"))?;
     }
 
-    // Resolve ONCE in isolated temp dir with scripts disabled.
-    let npm_out = Command::new("npm")
-        .current_dir(&tmp_dir)
+    // Resolve ONCE in private isolated temp dir with scripts, user/global npmrc, and git disabled (`--` prevents flag injection).
+    let npm_out = scrubbed_npm_command(tmp_dir)
         .args([
             "install",
             "--package-lock-only",
             "--ignore-scripts",
             "--no-audit",
             "--no-fund",
+            &user_rc_arg,
+            &global_rc_arg,
+            "--",
             package,
         ])
         .output()
@@ -1158,7 +1567,6 @@ fn execute_add(
 
     if !npm_out.status.success() {
         let stderr = String::from_utf8_lossy(&npm_out.stderr);
-        let _ = fs::remove_dir_all(&tmp_dir);
         return Err(format!("npm lockfile resolution failed: {}", stderr.trim()));
     }
 
@@ -1166,7 +1574,6 @@ fn execute_add(
         .map_err(|e| format!("read resolved package-lock.json: {e}"))?;
     let head_pkg_bytes = fs::read(tmp_dir.join("package.json"))
         .map_err(|e| format!("read resolved package.json: {e}"))?;
-    let _ = fs::remove_dir_all(&tmp_dir);
 
     let (items, transition_errors, passed) = run_check_bytes(
         &base_lock_bytes,
@@ -1179,11 +1586,18 @@ fn execute_add(
         cfg,
         &[],
         &[],
+        true,
     )?;
 
     let mut installed = false;
     if passed && install {
-        // Verify project manifest & lockfile were not modified concurrently during check (zero TOCTOU!).
+        // Verify project manifest & lockfile were not modified, created, or symlink-swapped during check (zero TOCTOU!).
+        reject_symlink(&base_pkg_path)?;
+        reject_symlink(&base_lock_path)?;
+        validate_project_npmrc(&npmrc_path)?;
+        if project_dir.join("npm-shrinkwrap.json").exists() {
+            return Err("npm-shrinkwrap.json appeared during Assay check; refusing to install".into());
+        }
         if had_base_pkg {
             let cur = fs::read(&base_pkg_path)
                 .map_err(|e| format!("re-read package.json before install: {e}"))?;
@@ -1192,6 +1606,10 @@ fn execute_add(
                     "package.json changed on disk during Assay check; refusing to overwrite".into(),
                 );
             }
+        } else if base_pkg_path.exists() {
+            return Err(
+                "package.json appeared on disk during Assay check; refusing to overwrite".into(),
+            );
         }
         if had_base_lock {
             let cur = fs::read(&base_lock_path)
@@ -1202,20 +1620,43 @@ fn execute_add(
                         .into(),
                 );
             }
+        } else if base_lock_path.exists() {
+            return Err(
+                "package-lock.json appeared on disk during Assay check; refusing to overwrite"
+                    .into(),
+            );
         }
 
-        // Write the EXACT checked manifest & lockfile, then install strictly from that lockfile (`npm ci --ignore-scripts`).
-        fs::write(&base_pkg_path, &head_pkg_bytes)
+        // Write the EXACT checked manifest & lockfile atomically (refusing symlinks),
+        // then install strictly from that lockfile (`npm ci --ignore-scripts`).
+        write_atomic_no_symlink(&base_pkg_path, &head_pkg_bytes)
             .map_err(|e| format!("write checked package.json: {e}"))?;
-        fs::write(&base_lock_path, &head_lock_bytes)
+        write_atomic_no_symlink(&base_lock_path, &head_lock_bytes)
             .map_err(|e| format!("write checked package-lock.json: {e}"))?;
 
-        let ci_out = Command::new("npm")
-            .current_dir(project_dir)
-            .args(["ci", "--ignore-scripts", "--no-audit", "--no-fund"])
+        let ci_out = scrubbed_npm_command(project_dir)
+            .args([
+                "ci",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                &user_rc_arg,
+                &global_rc_arg,
+            ])
             .output()
             .map_err(|e| format!("failed spawning npm ci: {e}"))?;
         if !ci_out.status.success() {
+            // Roll back manifest & lockfile so failed installs never leave dirty state.
+            if had_base_pkg {
+                let _ = write_atomic_no_symlink(&base_pkg_path, &base_pkg_bytes);
+            } else {
+                let _ = fs::remove_file(&base_pkg_path);
+            }
+            if had_base_lock {
+                let _ = write_atomic_no_symlink(&base_lock_path, &base_lock_bytes);
+            } else {
+                let _ = fs::remove_file(&base_lock_path);
+            }
             return Err(format!(
                 "npm ci --ignore-scripts failed: {}",
                 String::from_utf8_lossy(&ci_out.stderr).trim()
@@ -1223,6 +1664,7 @@ fn execute_add(
         }
         installed = true;
     }
+    drop(tmp_guard);
 
     Ok(AddResult {
         items,
@@ -1389,7 +1831,10 @@ fn run_replay(
     let bundle = RecordStore::load_input_bundle(bundle_dir)?;
     let limits = ArchiveLimits::default();
 
-    let new_bytes = fs::read(bundle_dir.join(&bundle.new_tarball_file))
+    validate_safe_filename(&bundle.new_tarball_file)?;
+    let new_tgz_path = bundle_dir.join(&bundle.new_tarball_file);
+    reject_symlink(&new_tgz_path)?;
+    let new_bytes = fs::read(&new_tgz_path)
         .map_err(|e| format!("read bundle tarball {}: {e}", bundle.new_tarball_file))?;
     let new_archive = inspect_tgz(&new_bytes, Some(&bundle.new_sha512), limits)?;
     let new_manifest = extract_manifest_facts(&new_archive);
@@ -1426,7 +1871,10 @@ fn run_replay(
         &bundle.reference_anchor,
     ) {
         (Some(rv), Some(rf), Some(rs), Some(ra)) => {
-            let rb = fs::read(bundle_dir.join(rf))
+            validate_safe_filename(rf)?;
+            let ref_tgz_path = bundle_dir.join(rf);
+            reject_symlink(&ref_tgz_path)?;
+            let rb = fs::read(&ref_tgz_path)
                 .map_err(|e| format!("read ref bundle tarball {rf}: {e}"))?;
             let r_arch = inspect_tgz(&rb, Some(rs), limits)?;
             let mut ref_blobs_by_sha1 = BTreeMap::new();
@@ -1459,7 +1907,10 @@ fn run_replay(
 
     let (history_ctx, hist_sha) = match &bundle.registry_snapshot_file {
         Some(rf) => {
-            let raw = fs::read(bundle_dir.join(rf))
+            validate_safe_filename(rf)?;
+            let reg_path = bundle_dir.join(rf);
+            reject_symlink(&reg_path)?;
+            let raw = fs::read(&reg_path)
                 .map_err(|e| format!("read registry snapshot {rf}: {e}"))?;
             let val: Value = serde_json::from_slice(&raw)
                 .map_err(|e| format!("parse registry snapshot: {e}"))?;
@@ -1471,7 +1922,7 @@ fn run_replay(
             let diffs = new_archive
                 .contents
                 .iter()
-                .find(|(p, _)| strip_archive_root(p) == "package.json")
+                .find(|(p, _)| strip_archive_root(p).eq_ignore_ascii_case("package.json"))
                 .map(|(_, bytes)| {
                     registry_manifest_differs(bytes, &new_reg, new_manifest.has_binding_gyp)
                 })
@@ -1677,6 +2128,7 @@ impl McpDispatcher for CliMcpDispatcher {
                         save_inputs: false,
                         is_new_direct: false,
                         is_new_to_project: false,
+                        allow_store_approvals: true,
                         lock_alarms: BTreeSet::new(),
                         pr_approvals: &[],
                     },
@@ -1727,6 +2179,7 @@ impl McpDispatcher for CliMcpDispatcher {
                     &self.cfg,
                     &[],
                     &[],
+                    true,
                 )?;
                 Ok(change_report_json(&items, &[], &transition_errors, passed))
             }
@@ -1809,4 +2262,27 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_safe_npm_package_specs_and_blocks_flag_or_url_injection() {
+        assert!(validate_npm_package_spec("zod").is_ok());
+        assert!(validate_npm_package_spec("zod@4.6.7").is_ok());
+        assert!(validate_npm_package_spec("@types/node@^22.0.0").is_ok());
+        assert!(validate_npm_package_spec("chalk@6.0.1").is_ok());
+
+        assert!(validate_npm_package_spec("--ignore-scripts=false").is_err());
+        assert!(validate_npm_package_spec("-g").is_err());
+        assert!(validate_npm_package_spec("--registry=https://evil.test").is_err());
+        assert!(validate_npm_package_spec("file:../evil").is_err());
+        assert!(validate_npm_package_spec("https://evil.test/pkg.tgz").is_err());
+        assert!(validate_npm_package_spec("git+https://github.com/a/b.git").is_err());
+        assert!(validate_npm_package_spec("foo bar").is_err());
+        assert!(validate_npm_package_spec("zod@1.0.0\n--ignore-scripts=false").is_err());
+        assert!(validate_npm_package_spec("../evil").is_err());
+    }
 }

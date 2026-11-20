@@ -93,13 +93,28 @@ pub fn build_transition_ledger(
     let mut unexplained_code_bytes = 0u64;
     let mut unexplained_non_exec_bytes = 0u64;
 
+    let mut declared_exec_rel_paths: BTreeSet<String> = BTreeSet::new();
+    for p in input
+        .new_profile
+        .manifest
+        .bin_paths
+        .iter()
+        .chain(input.new_profile.manifest.entry_paths.iter())
+    {
+        declared_exec_rel_paths.insert(p.trim_start_matches("./").to_ascii_lowercase());
+    }
+
     for f in &files {
         if f.class != OriginClass::Carried {
             non_carried_paths.insert(f.path.clone());
         }
         if f.class == OriginClass::Unexplained {
             unexplained_paths.insert(f.path.clone());
-            if matches!(f.role, FileRole::Declaration | FileRole::SourceMap | FileRole::Doc) {
+            let rel_lower = crate::archive::strip_archive_root(&f.path).to_ascii_lowercase();
+            let is_declared_exec = declared_exec_rel_paths.contains(&rel_lower);
+            if !is_declared_exec
+                && matches!(f.role, FileRole::Declaration | FileRole::SourceMap | FileRole::Doc)
+            {
                 unexplained_non_exec_bytes += f.bytes;
             } else {
                 unexplained_code_bytes += f.bytes;
@@ -370,6 +385,18 @@ pub fn evaluate_decision(
             policy.min_age_hours,
             published_age_hours.unwrap_or(0)
         ));
+    }
+
+    // Policy gate: require human review after a passed reading when configured (`read_pass = "require_human"`).
+    // Recorded in `stop_facts` BEFORE S10 so prior approvals for weaker facts cannot bypass it!
+    if reading_required
+        && reading_outcome == ReadingOutcome::Passed
+        && policy.read_pass == ReadPassPolicy::RequireHuman
+    {
+        stop_facts.insert("policy:read_pass_require_human".to_string());
+        stop_reasons.push(
+            "policy requires explicit human approval even after reading passed (read_pass = require_human)".to_string(),
+        );
     }
 
     // S10: Granular staleness check — ANY concrete stop fact absent from `prior_approved_facts` invalidates the approval!

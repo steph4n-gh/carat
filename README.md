@@ -6,6 +6,8 @@ When an npm package is added or updated, Carat inspects the published tarball in
 
 Single Rust binary. Zero runtime dependencies beyond `git`, `curl`, and `npm`. Built for both humans and coding agents.
 
+![Carat terminal demo](docs/demo.gif)
+
 ---
 
 ## What Carat shows you
@@ -18,29 +20,21 @@ ok    1 package(s) fully explained
 Installed exact checked lockfile via `npm ci --ignore-scripts`.
 ```
 
-When something does not match upstream source or breaks historical continuity, Carat stops and prints the exact leftover diff and approval ID:
+Even when every file matches Git source, Carat stops on historical continuity breaks (such as a repository ownership change) and prints the exact approval ID:
 
 ```text
 $ carat explain ms@2.1.2..2.1.3
 STOP  ms 2.1.2 -> 2.1.3
-      anchor: none (tried: provenance, gitHead, tag)
-      published: 2172d ago (Settled)
-      balance: 0 of 4 files accounted for (0 carried, 4 changed = 6.6 KiB)
-        - Unexplained           4 file(s),   6.6 KiB (code/manifest: 3.7 KiB, non-exec d.ts/map/doc: 2.9 KiB)
-      leftover code diff(s) not matched to source:
-        --- package/index.js (3.0 KiB) ---
-        @@ -24,5 +24,5 @@
-        -module.exports = function(val, options) {
-        +module.exports = function (val, options) {
+      anchor: 1c6264b79549 via GitHead @ https://github.com/vercel/ms
+      published: 2173d ago (Settled)
+      balance: 4 of 4 files accounted for (0 carried, 4 changed = 6.6 KiB)
+        - Source                4 file(s),   6.6 KiB
       breaks:
-        ! source anchor disappeared — no source anchor found, though prior releases had one
         ! source repository changed — repository changed to https://github.com/vercel/ms
       why stopped:
-        - source anchor disappeared (no source anchor found, though prior releases had one)
         - source repository changed (repository changed to https://github.com/vercel/ms)
-        - unexplained code or flags remain (inspect the inline diff below, or re-run with --read)
-      approve with: carat approve f0ea07e387524fb6
-      subject: 4dbf5392e222bdab | ledger: f0ea07e387524fb6
+      approve with: carat approve 12b0130186a9334e
+      subject: 4dbf5392e222bdab | ledger: 12b0130186a9334e
 ```
 
 ---

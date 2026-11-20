@@ -6,14 +6,17 @@ use carat_core::model::{Anchor, AnchorMethod, ArchiveLimits, ManifestFacts};
 use carat_core::normalize::canonicalize_repo_url;
 use carat_core::source::SourceSnapshot;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 pub struct Fetcher {
     cache_dir: PathBuf,
+    repo_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    ls_remote_cache: Mutex<HashMap<String, Result<BTreeMap<String, String>, String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,7 +41,51 @@ impl Fetcher {
             .map_err(|e| format!("failed to create git cache dir: {e}"))?;
         let cache_dir = fs::canonicalize(&cache_dir)
             .map_err(|e| format!("failed to canonicalize cache dir: {e}"))?;
-        Ok(Self { cache_dir })
+        Ok(Self {
+            cache_dir,
+            repo_locks: Mutex::new(HashMap::new()),
+            ls_remote_cache: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn repo_lock(&self, repo_url: &str) -> Arc<Mutex<()>> {
+        let mut map = self
+            .repo_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(repo_url.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn git_ls_remote_cached(&self, repo_url: &str) -> Result<BTreeMap<String, String>, String> {
+        {
+            let cache = self
+                .ls_remote_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(hit) = cache.get(repo_url) {
+                return hit.clone();
+            }
+        }
+        let repo_mutex = self.repo_lock(repo_url);
+        let _guard = repo_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let cache = self
+                .ls_remote_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(hit) = cache.get(repo_url) {
+                return hit.clone();
+            }
+        }
+        let res = git_ls_remote(&self.cache_dir, repo_url);
+        let mut cache = self
+            .ls_remote_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.insert(repo_url.to_string(), res.clone());
+        res
     }
 
     pub fn fetch_registry_package(&self, name: &str) -> Result<RegistryPackageDoc, String> {
@@ -136,7 +183,7 @@ impl Fetcher {
                     .cache_dir
                     .join("tarballs")
                     .join(format!("{actual_hex}.tgz"));
-                let _ = fs::write(p, &b);
+                let _ = carat_core::store::write_atomic_no_symlink(&p, &b);
                 b
             }
         };
@@ -325,7 +372,7 @@ impl Fetcher {
         if let Some(ref url) = repo_url {
             if validate_public_https_git_url(url).is_ok() {
                 methods_tried.push("tag".to_string());
-                match git_ls_remote(&self.cache_dir, url) {
+                match self.git_ls_remote_cached(url) {
                     Ok(refs) => {
                         for (refname, sha) in &refs {
                             if refname.starts_with("refs/heads/") {
@@ -503,6 +550,8 @@ impl Fetcher {
         if commit.eq_ignore_ascii_case(branch_head) {
             return true;
         }
+        let repo_mutex = self.repo_lock(repo_url);
+        let _guard = repo_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let repo_key = sha256_hex(repo_url.as_bytes());
         let repo_dir = self.cache_dir.join("git").join(&repo_key[..24]);
         if !repo_dir.exists() {
@@ -536,6 +585,8 @@ impl Fetcher {
         if !repo_url.starts_with("https://") || from_commit.eq_ignore_ascii_case(to_commit) {
             return (Vec::new(), None);
         }
+        let repo_mutex = self.repo_lock(repo_url);
+        let _guard = repo_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let repo_key = sha256_hex(repo_url.as_bytes());
         let repo_dir = self.cache_dir.join("git").join(&repo_key[..24]);
         if !repo_dir.exists() {
@@ -615,6 +666,8 @@ impl Fetcher {
         if !is_hex_commit(commit) {
             return Err(format!("invalid git commit oid '{commit}'"));
         }
+        let repo_mutex = self.repo_lock(repo_url);
+        let _guard = repo_mutex.lock().unwrap_or_else(|e| e.into_inner());
 
         let repo_key = sha256_hex(repo_url.as_bytes());
         let repo_dir = self.cache_dir.join("git").join(&repo_key[..24]);

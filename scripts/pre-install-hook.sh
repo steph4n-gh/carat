@@ -128,6 +128,7 @@ for tokens in segments:
 
     if subcmd in NPM_MUTATING:
         pkgs = []
+        is_dev = False
         skip_next = False
         for tok in tokens[sub_idx + 1:]:
             if skip_next:
@@ -136,10 +137,17 @@ for tokens in segments:
             if tok in FLAGS_WITH_VAL:
                 skip_next = True
                 continue
+            if tok in ("-D", "--save-dev"):
+                is_dev = True
+                continue
             if tok.startswith("-"):
                 continue
             pkgs.append(tok)
-        blocked.append(" ".join(pkgs) if pkgs else f"npm {subcmd}")
+        if pkgs:
+            prefix = "-D " if is_dev else ""
+            blocked.append(prefix + " ".join(pkgs))
+        else:
+            blocked.append(f"npm {subcmd}")
 
 if not blocked:
     respond(is_agy, True)

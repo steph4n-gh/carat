@@ -22,7 +22,7 @@ The workflow verifies the downloaded `carat` tarball against a SHA-256 digest be
 
 ```yaml
 env:
-  CARAT_RELEASE_URL: "https://github.com/steph4n-gh/carat/releases/download/v0.1.0/carat-x86_64-unknown-linux-gnu.tar.gz"
+  CARAT_RELEASE_URL: "https://github.com/steph4n-gh/carat/releases/download/v0.2.0/carat-x86_64-unknown-linux-gnu.tar.gz"
   CARAT_SHA256: "<64-char-lowercase-sha256>"
 ```
 

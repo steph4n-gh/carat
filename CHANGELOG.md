@@ -2,6 +2,17 @@
 
 All notable changes to Carat are documented in this file.
 
+## [0.2.0] - 2026-11-20
+
+### Added
+- **Bounded parallel transition evaluation (`carat check` / `carat add` / `carat pr`):** Evaluates up to 8 packages concurrently using stdlib scoped threads with per-repository Git cache locks, in-memory `git ls-remote` deduplication, atomic tarball caching, and deterministic index-preserving output order (~4.7× faster cold `carat add vite`: 93s → 19.6s).
+- **Grouped cross-platform optional binary summaries:** Identical sibling OS/CPU native binary stops (e.g., `@rolldown/binding-*`, `lightningcss-*`) now collapse into a single readable block in CLI and PR Markdown reports—while automatically splitting out any platform with distinct breaks, new reach, JS diffs, non-version manifest diffs, or reader findings—and emit a single copy-pasteable batch `carat approve <id1> <id2> ...` line.
+- **Multi-ID PR approval comments:** `carat pr` and `docs/workflows/carat-pr.yml` now accept standalone single-line `carat approve <id1> <id2> ...` comments from write-access maintainers (strictly rejecting self-approval and prose).
+- **Hook `-D`/`--save-dev` forwarding & CI tests:** `scripts/pre-install-hook.sh` now preserves `-D` in suggested `carat add -D ...` commands and is regression-tested in GitHub CI (`scripts/test-pre-install-hook.py`).
+
+### Fixed
+- **Thread-safe atomic temp writes (`carat-core`):** Added an atomic sequence counter to `write_atomic_no_symlink` so concurrent workers can never collide on sibling temp filenames.
+
 ## [0.1.1] - 2026-11-20
 
 ### Fixed

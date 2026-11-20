@@ -1129,6 +1129,8 @@ fn run_check_bytes(
     let mut items = Vec::with_capacity(unique.len());
     let mut transition_errors = Vec::new();
     let mut bundle_root_cache: BTreeMap<String, LoadedArchive> = BTreeMap::new();
+    let mut pending = Vec::new();
+
     for (t, paths) in unique {
         if t.in_bundle && t.new_resolved.is_none() {
             // Verify EVERY deduplicated instance path in the group against its enclosing
@@ -1163,18 +1165,76 @@ fn run_check_bytes(
             }
             continue;
         }
+        pending.push(t);
+    }
+
+    // Evaluate non-bundled transitions with bounded parallelism (up to 8 workers),
+    // preserving deterministic input order in the final report.
+    const MAX_WORKERS: usize = 8;
+    let worker_count = pending.len().min(MAX_WORKERS);
+    let results: Vec<Result<TransitionReportItem, String>> = if worker_count <= 1 {
+        pending
+            .iter()
+            .map(|t| {
+                eval_lock_transition(
+                    &fetcher,
+                    &store,
+                    cfg,
+                    t,
+                    read,
+                    as_of,
+                    pr_approvals,
+                    allow_store_approvals,
+                )
+            })
+            .collect()
+    } else {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let next_idx = AtomicUsize::new(0);
+        let slots: Vec<Mutex<Option<Result<TransitionReportItem, String>>>> = (0..pending.len())
+            .map(|_| Mutex::new(None))
+            .collect();
+
+        std::thread::scope(|s| {
+            for _ in 0..worker_count {
+                s.spawn(|| {
+                    loop {
+                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= pending.len() {
+                            break;
+                        }
+                        let res = eval_lock_transition(
+                            &fetcher,
+                            &store,
+                            cfg,
+                            &pending[idx],
+                            read,
+                            as_of,
+                            pr_approvals,
+                            allow_store_approvals,
+                        );
+                        *slots[idx].lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
+                    }
+                });
+            }
+        });
+
+        slots
+            .into_iter()
+            .map(|slot| {
+                slot.into_inner()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(|| Err("worker did not populate transition slot".into()))
+            })
+            .collect()
+    };
+
+    for (t, res) in pending.iter().zip(results) {
         // Per-transition isolation: one unfetchable/private/non-registry package stops that transition
         // instead of crashing the entire check with exit 2.
-        match eval_lock_transition(
-            &fetcher,
-            &store,
-            cfg,
-            &t,
-            read,
-            as_of,
-            pr_approvals,
-            allow_store_approvals,
-        ) {
+        match res {
             Ok(item) => items.push(item),
             Err(e) => transition_errors.push(format!(
                 "{}@{} ({}): {e}",

@@ -1,7 +1,7 @@
 # Drop-in GitHub Actions workflow for Carat pull request checks (SPEC section 10.3).
 # Runs strictly from the protected base revision (`pull_request_target`) without ever
 # executing PR head code. Maintainers approve stops by commenting a single standalone line:
-#   carat approve <ledger_id_prefix>
+#   carat approve <ledger_id_prefix> [<ledger_id_prefix> ...]
 name: Carat Dependency Gate
 
 on:
@@ -50,7 +50,7 @@ jobs:
               repo: context.repo.repo,
               issue_number: prNum,
             });
-            const approveRe = /^carat approve [0-9a-fA-F]{16,64}$/;
+            const approveRe = /^carat approve [0-9a-fA-F]{16,64}(?: +[0-9a-fA-F]{16,64})*$/;
             const out = [];
             for (const c of comments) {
               const body = (c.body || '').trim();

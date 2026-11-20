@@ -128,10 +128,11 @@ pub fn detect_protected_file_tampering(changed_paths: &[String]) -> Vec<String> 
         .collect()
 }
 
-/// Parses exact standalone `carat approve <hex_id>` PR comments (SPEC section 10.3).
+/// Parses exact standalone `carat approve <hex_id> [<hex_id> ...]` PR comments (SPEC section 10.3).
 /// Enforces:
 /// - Approver has write access and MUST NOT be the PR author.
-/// - Entire trimmed comment body MUST be a single line `carat approve <16..=64 hex>` (never matched inside prose, quotes, or code blocks).
+/// - Entire trimmed comment body MUST be a single line `carat approve` followed only by one or more
+///   `16..=64` hex IDs (never matched inside prose, quotes, or code blocks).
 pub fn parse_approval_comments(
     comments: &[PrComment],
     pr_author: &str,
@@ -146,16 +147,21 @@ pub fn parse_approval_comments(
             continue;
         }
         if let Some(rest) = body.strip_prefix("carat approve ") {
-            let subj = rest.trim();
-            if subj.len() >= 16
-                && subj.len() <= 64
-                && subj.bytes().all(|b| b.is_ascii_hexdigit())
-            {
-                out.push(ParsedPrApproval {
-                    subject: subj.to_ascii_lowercase(),
-                    approver: c.author.clone(),
-                    approved_at: c.created_at.clone(),
+            let tokens: Vec<&str> = rest.split_whitespace().collect();
+            let all_valid = !tokens.is_empty()
+                && tokens.iter().all(|tok| {
+                    tok.len() >= 16
+                        && tok.len() <= 64
+                        && tok.bytes().all(|b| b.is_ascii_hexdigit())
                 });
+            if all_valid {
+                for tok in tokens {
+                    out.push(ParsedPrApproval {
+                        subject: tok.to_ascii_lowercase(),
+                        approver: c.author.clone(),
+                        approved_at: c.created_at.clone(),
+                    });
+                }
             }
         }
     }
@@ -217,11 +223,25 @@ mod tests {
                 has_write_access: true,
                 created_at: "2026-11-19T23:02:00Z".into(),
             },
+            PrComment {
+                author: "maintainer".into(),
+                body: "carat approve aaaa1111bbbb2222 cccc3333dddd4444".into(),
+                has_write_access: true,
+                created_at: "2026-11-19T23:03:00Z".into(),
+            },
+            PrComment {
+                author: "maintainer".into(),
+                body: "carat approve 9999888877776666 looks good to me".into(),
+                has_write_access: true,
+                created_at: "2026-11-19T23:04:00Z".into(),
+            },
         ];
         let parsed = parse_approval_comments(&comments, "renovate");
-        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0].approver, "maintainer");
         assert_eq!(parsed[0].subject, "7f3c1234abcd5678");
+        assert_eq!(parsed[1].subject, "aaaa1111bbbb2222");
+        assert_eq!(parsed[2].subject, "cccc3333dddd4444");
     }
 
     #[test]

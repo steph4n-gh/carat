@@ -68,24 +68,25 @@ Check a pull request reading revisions strictly from Git object storage (never c
 | `--markdown-out <PATH>` | None | Write Markdown summary alongside `--json` in a single evaluation |
 | `--read` | `false` | Run the configured reader when required |
 
-### `carat add <PACKAGE>`
+### `carat add [OPTIONS] <PACKAGES>...`
 
-Resolve once in an isolated `0700` temp directory, check every changed package, and optionally write that exact checked lockfile and install with `npm ci --ignore-scripts`.
+Resolve once in an isolated `0700` temp directory, check every changed package (in parallel across up to 8 workers), and optionally write that exact checked lockfile and install with `npm ci --ignore-scripts`.
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `<PACKAGE>` | *(required)* | Registry package spec (`<name>` or `<name>@<ver/range>` without spaces, `||`, leading `-`, URLs, or `file:`/`git+`/`npm:` schemes) |
+| `<PACKAGES>...` | *(required)* | One or more registry package specs (`<name>` or `<name>@<ver/range>` without spaces, `||`, leading `-`, URLs, or `file:`/`git+`/`npm:` schemes) |
+| `-D`, `--dev` | `false` | Save to `devDependencies` (`npm install --save-dev`) |
 | `--project-dir <PATH>` | `.` | Project directory containing `package.json` and `package-lock.json` |
 | `--read` | `false` | Run the configured reader when required |
 | `--install` | `false` | Write the exact checked `package.json` and `package-lock.json` and run `npm ci --ignore-scripts` if `passed == true` |
 
-### `carat approve <ID>`
+### `carat approve <IDS>...`
 
-Record a human approval in `.carat/approvals/<subject>.json` bound to the transition's concrete `stop_facts`.
+Record one or more human approvals in `.carat/approvals/<subject>.json` bound to each transition's concrete `stop_facts`. All IDs are validated upfront before any approval file is written.
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `<ID>` | *(required)* | Unique 8–64 hex prefix of `decision.ledger_id` or `ledger.subject` |
+| `<IDS>...` | *(required)* | One or more unique 8–64 hex prefixes of `decision.ledger_id` or `ledger.subject` |
 | `--by <NAME>` | `$USER` | Approver identifier |
 | `--note <TEXT>` | None | Approval rationale |
 | `--non-interactive` | `false` | Allow execution without an interactive TTY (human scripts only) |

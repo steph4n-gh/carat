@@ -54,7 +54,7 @@ Example configuration:
 | --- | --- | --- | --- |
 | `carat_explain` | `spec` (`<name>@<from>..<to>`) | `read` (`bool`) | Inspect one npm version jump from the registry |
 | `carat_check` | `base_lock`, `head_lock` | `base_pkg`, `head_pkg`, `read` | Check a `package-lock.json` v3 diff |
-| `carat_add` | `package` | `project_dir`, `read`, `install` | Resolve once in temp, check every transition, and install exact lockfile via `npm ci --ignore-scripts` when `install: true` and `passed: true` |
+| `carat_add` | `package` | `dev`, `project_dir`, `read`, `install` | Resolve once in temp, check every transition, and install exact lockfile via `npm ci --ignore-scripts` when `install: true` and `passed: true` |
 
 `carat mcp` deliberately omits any approval or config-mutation tool. Unknown tool names return a JSON-RPC error.
 
@@ -82,13 +82,34 @@ In Claude Code (`~/.claude/settings.json` or `.claude/settings.json`):
 }
 ```
 
+In Antigravity (`~/.gemini/config/hooks.json` or `.agents/hooks.json`):
+
+```json
+{
+  "carat-pre-install": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/carat/scripts/pre-install-hook.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
 How `scripts/pre-install-hook.sh` behaves:
 
-- Compatible with stock macOS `/bin/bash` 3.2 and bash 5+.
-- Reads the hook JSON payload strictly from stdin (never process `argv`) and fails closed (`exit 2`) if the payload cannot be parsed.
+- Compatible with stock macOS `/bin/bash` 3.2 and bash 5+, and auto-detects both Claude Code (`tool_input.command` + `exit 2`) and Antigravity (`toolCall.args.CommandLine` + JSON `{"decision":"allow"|"deny"}` on stdout).
+- Uses POSIX `shlex` tokenization (preserving quoted semicolons and heredocs), reads hook JSON strictly from stdin, and fails closed if an unparseable command references `npm`.
 - Intercepts direct `npm install`, `npm i`, `npm add`, `npm update`, and common npm install aliases—including leading `env`, `command`, `nohup`, `sudo`, environment assignments, and flags before the subcommand.
-- Always blocks mutating `npm` installs (`exit 2`) and tells the agent to run `carat add <pkg> --install --json` or `carat check ... && npm ci --ignore-scripts` instead.
-- Allows `npm ci`, `npm test`, `npm run ...`, and non-npm commands (`exit 0`).
+- Always blocks mutating `npm` installs and tells the agent to run `carat add [-D] <pkg> --install --json` or `carat check ... && npm ci --ignore-scripts` instead.
+- Allows `npm ci`, `npm test`, `npm run ...`, and non-npm commands.
 
 ---
 

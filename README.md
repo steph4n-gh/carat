@@ -57,8 +57,8 @@ Download the tarball for your platform from [GitHub Releases](https://github.com
 # Example (macOS Apple Silicon; replace target for x86_64-apple-darwin,
 # x86_64-unknown-linux-gnu, or aarch64-unknown-linux-gnu):
 TARGET="aarch64-apple-darwin"
-curl -fsSLO "https://github.com/steph4n-gh/carat/releases/download/v0.1.0/carat-${TARGET}.tar.gz"
-curl -fsSLO "https://github.com/steph4n-gh/carat/releases/download/v0.1.0/SHA256SUMS.txt"
+curl -fsSLO "https://github.com/steph4n-gh/carat/releases/download/v0.2.0/carat-${TARGET}.tar.gz"
+curl -fsSLO "https://github.com/steph4n-gh/carat/releases/download/v0.2.0/SHA256SUMS.txt"
 grep "carat-${TARGET}.tar.gz" SHA256SUMS.txt | shasum -a 256 -c -
 mkdir -p ~/.local/bin && tar -xzf "carat-${TARGET}.tar.gz" -C ~/.local/bin
 ```

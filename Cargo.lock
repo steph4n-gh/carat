@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "carat"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "carat-core",
  "clap",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "carat-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "base64",
  "flate2",

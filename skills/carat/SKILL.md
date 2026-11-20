@@ -9,8 +9,8 @@ Use **Carat** before installing any npm package or accepting any `package-lock.j
 
 ## Workflow
 
-1. **Installing or adding a package:**
-   - Run `carat add <pkg> --install --json` (or call MCP tool `carat_add` with `{"package": "<pkg>", "install": true}`).
+1. **Installing or adding packages:**
+   - Run `carat add [-D] <pkg>... --install --json` (or call MCP tool `carat_add` with `{"package": "<pkg>", "dev": false, "install": true}`).
    - Pass `--read` (or `"read": true`) when `ANTHROPIC_API_KEY` is set.
    - Check the exit code (or `"passed"` boolean in MCP output):
      - **Exit `0` (`passed: true`):** Every transition is `explained`, `read`, or already approved by a human, and Carat installed that exact checked lockfile via `npm ci --ignore-scripts`.

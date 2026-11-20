@@ -5,7 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalRecord {
@@ -99,7 +102,11 @@ pub fn write_atomic_no_symlink(target: &Path, bytes: &[u8]) -> Result<(), String
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp_path = parent.join(format!(".{base_name}.carat-tmp-{}-{nonce}", std::process::id()));
+    let seq = TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(
+        ".{base_name}.carat-tmp-{}-{nonce}-{seq}",
+        std::process::id()
+    ));
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)

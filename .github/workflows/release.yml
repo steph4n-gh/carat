@@ -23,12 +23,12 @@ jobs:
             os: ubuntu-latest
             cross: true
             linker: aarch64-linux-gnu-gcc
-            apt_pkg: gcc-aarch64-linux-gnu
+            apt_pkg: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             cross: false
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-latest
             cross: true
 
     steps:
@@ -44,7 +44,7 @@ jobs:
         if: matrix.apt_pkg != ''
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends "${{ matrix.apt_pkg }}"
+          sudo apt-get install -y ${{ matrix.apt_pkg }}
 
       - name: Run workspace tests (native targets)
         if: "!matrix.cross"

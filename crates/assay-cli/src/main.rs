@@ -1123,31 +1123,39 @@ fn run_check_bytes(
     let mut items = Vec::with_capacity(unique.len());
     let mut transition_errors = Vec::new();
     let mut bundle_root_cache: BTreeMap<String, LoadedArchive> = BTreeMap::new();
-    for (t, _paths) in unique {
+    for (t, paths) in unique {
         if t.in_bundle && t.new_resolved.is_none() {
-            // Only skip an `inBundle` entry if its nearest enclosing non-bundled ancestor tarball
-            // physically contains `<rel_path>/package.json` with matching name & version.
-            match verify_bundled_in_ancestor(&fetcher, &t, &head_pkg_map, &mut bundle_root_cache) {
-                Ok(true) => continue,
-                Ok(false) => {
-                    transition_errors.push(format!(
-                        "{}@{} ({}): forged or unverified inBundle entry (enclosing bundle archive does not contain matching package.json)",
-                        t.name,
-                        t.new_version.as_deref().unwrap_or("?"),
-                        t.instance_path
-                    ));
-                    continue;
-                }
-                Err(e) => {
-                    transition_errors.push(format!(
-                        "{}@{} ({}): failed verifying inBundle ancestor: {e}",
-                        t.name,
-                        t.new_version.as_deref().unwrap_or("?"),
-                        t.instance_path
-                    ));
-                    continue;
+            // Verify EVERY deduplicated instance path in the group against its enclosing
+            // non-bundled ancestor archive so a legitimate bundled copy cannot mask a forged sibling path.
+            for inst_path in &paths {
+                match verify_bundled_in_ancestor(
+                    &fetcher,
+                    inst_path,
+                    &t.name,
+                    t.new_version.as_deref(),
+                    &head_pkg_map,
+                    &mut bundle_root_cache,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        transition_errors.push(format!(
+                            "{}@{} ({}): forged or unverified inBundle entry (enclosing bundle archive does not contain matching package.json)",
+                            t.name,
+                            t.new_version.as_deref().unwrap_or("?"),
+                            inst_path
+                        ));
+                    }
+                    Err(e) => {
+                        transition_errors.push(format!(
+                            "{}@{} ({}): failed verifying inBundle ancestor: {e}",
+                            t.name,
+                            t.new_version.as_deref().unwrap_or("?"),
+                            inst_path
+                        ));
+                    }
                 }
             }
+            continue;
         }
         // Per-transition isolation: one unfetchable/private/non-registry package stops that transition
         // instead of crashing the entire check with exit 2.
@@ -1184,11 +1192,13 @@ fn run_check_bytes(
 /// that bundle root tarball with matching `name` and `version`.
 fn verify_bundled_in_ancestor(
     fetcher: &Fetcher,
-    t: &LockTransition,
+    instance_path: &str,
+    pkg_name: &str,
+    expected_version: Option<&str>,
     head_pkg_map: &BTreeMap<&str, &assay_core::lockfile::LockPackage>,
     archive_cache: &mut BTreeMap<String, LoadedArchive>,
 ) -> Result<bool, String> {
-    let Some((bundle_root_path, rel_subpath)) = find_bundle_root_ancestor(&t.instance_path, head_pkg_map) else {
+    let Some((bundle_root_path, rel_subpath)) = find_bundle_root_ancestor(instance_path, head_pkg_map) else {
         return Ok(false);
     };
     let Some(root_pkg) = head_pkg_map.get(bundle_root_path.as_str()) else {
@@ -1210,8 +1220,8 @@ fn verify_bundled_in_ancestor(
     Ok(archive_contains_bundled_package(
         root_arch,
         &rel_subpath,
-        &t.name,
-        t.new_version.as_deref(),
+        pkg_name,
+        expected_version,
     ))
 }
 

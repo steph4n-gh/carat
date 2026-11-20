@@ -1,0 +1,8 @@
+/target
+/.assay
+/.assay-cache
+/samples
+/hazardous
+*.tgz
+*.tar.gz
+.DS_Store

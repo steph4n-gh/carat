@@ -1,9 +1,14 @@
 pub mod archive;
 pub mod canonical;
+pub mod config;
 pub mod digest;
 pub mod history;
+pub mod lockfile;
 pub mod model;
 pub mod normalize;
+pub mod packet;
 pub mod policy;
 pub mod reach;
+pub mod reader;
 pub mod source;
+pub mod store;

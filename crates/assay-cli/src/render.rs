@@ -1,22 +1,53 @@
+use assay_core::lockfile::RouteEdge;
 use assay_core::model::{Decision, FileRole, OriginClass, TransitionLedger, Verdict};
+use assay_core::reader::ReadingRecord;
 
-pub fn render_explain_markdown(ledger: &TransitionLedger, decision: &Decision) -> String {
+pub struct TransitionReportItem {
+    pub ledger: TransitionLedger,
+    pub decision: Decision,
+    pub reading: Option<ReadingRecord>,
+    pub route: Vec<RouteEdge>,
+    pub approved_by: Option<String>,
+}
+
+pub fn render_explain_markdown(
+    ledger: &TransitionLedger,
+    decision: &Decision,
+    reading: Option<&ReadingRecord>,
+    route: &[RouteEdge],
+    approved_by: Option<&str>,
+) -> String {
     let mut out = String::new();
-    let badge = match decision.verdict {
-        Verdict::Explained => "OK  ",
-        Verdict::Read => "READ",
-        Verdict::Stop => "STOP",
+    let badge = match (decision.verdict, approved_by) {
+        (Verdict::Explained, _) => "OK  ",
+        (Verdict::Read, _) => "READ",
+        (Verdict::Stop, Some(_)) => "APPR",
+        (Verdict::Stop, None) => "STOP",
     };
 
     let ref_ver = ledger
         .reference
         .as_ref()
         .map(|r| r.version.as_str())
-        .unwrap_or("(none)");
+        .unwrap_or("(new)");
+    let route_str = if route.is_empty() {
+        String::new()
+    } else {
+        let chain = route
+            .iter()
+            .map(|e| e.to.as_str())
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        format!("  via root -> {chain}")
+    };
     out.push_str(&format!(
-        "{badge}  {} {} -> {}\n",
+        "{badge}  {} {} -> {}{route_str}\n",
         ledger.name, ref_ver, ledger.new.version
     ));
+
+    if let Some(approver) = approved_by {
+        out.push_str(&format!("      approved by: {approver}\n"));
+    }
 
     // Anchor summary
     if ledger.anchor.found {
@@ -69,7 +100,11 @@ pub fn render_explain_markdown(ledger: &TransitionLedger, decision: &Decision) -
     // Balance sheet table
     let total_files: u64 = ledger.totals.values().map(|t| t.files).sum();
     let total_bytes: u64 = ledger.totals.values().map(|t| t.bytes).sum();
-    let carried = ledger.totals.get(&OriginClass::Carried).cloned().unwrap_or_default();
+    let carried = ledger
+        .totals
+        .get(&OriginClass::Carried)
+        .cloned()
+        .unwrap_or_default();
     let changed_files = total_files.saturating_sub(carried.files);
     let changed_bytes = total_bytes.saturating_sub(carried.bytes);
     let unexplained = ledger
@@ -102,7 +137,6 @@ pub fn render_explain_markdown(ledger: &TransitionLedger, decision: &Decision) -
     }
     out.push('\n');
 
-    // Per-class breakdown for non-carried files
     for class in [
         OriginClass::Source,
         OriginClass::SourceElsewhere,
@@ -132,7 +166,6 @@ pub fn render_explain_markdown(ledger: &TransitionLedger, decision: &Decision) -
         }
     }
 
-    // List top unexplained executable files (up to 8)
     let unexplained_exec: Vec<_> = ledger
         .files
         .iter()
@@ -164,7 +197,6 @@ pub fn render_explain_markdown(ledger: &TransitionLedger, decision: &Decision) -
         }
     }
 
-    // Breaks & flags
     if !ledger.breaks.is_empty() {
         out.push_str("      breaks (stop):\n");
         for b in &ledger.breaks {
@@ -188,7 +220,6 @@ pub fn render_explain_markdown(ledger: &TransitionLedger, decision: &Decision) -
         }
     }
 
-    // Reach
     if !ledger.new_reach.is_empty() {
         let toks: Vec<String> = ledger
             .new_reach
@@ -216,12 +247,42 @@ pub fn render_explain_markdown(ledger: &TransitionLedger, decision: &Decision) -
         out.push_str(&format!("      new hostnames: {}\n", hosts.join(", ")));
     }
 
-    // Stop rules
-    if !decision.stop_reasons.is_empty() {
+    if let Some(r) = reading {
+        out.push_str(&format!(
+            "      reading ({}): {:?}{}\n",
+            r.model,
+            r.outcome,
+            if r.summary.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", r.summary)
+            }
+        ));
+        if let Some(ref err) = r.error_detail {
+            out.push_str(&format!("        note: {err}\n"));
+        }
+        for finding in &r.findings {
+            out.push_str(&format!(
+                "        ! [{:?}/{:?}] {}:{}-{}: {}\n",
+                finding.category,
+                finding.confidence,
+                finding.unit_id,
+                finding.start_line,
+                finding.end_line,
+                finding.statement
+            ));
+        }
+    }
+
+    if !decision.stop_reasons.is_empty() && approved_by.is_none() {
         out.push_str("      stop reasons:\n");
         for r in &decision.stop_reasons {
             out.push_str(&format!("        - {r}\n"));
         }
+        out.push_str(&format!(
+            "      approve with: assay approve {}\n",
+            &ledger.subject[..16]
+        ));
     }
 
     out.push_str(&format!(
@@ -229,6 +290,87 @@ pub fn render_explain_markdown(ledger: &TransitionLedger, decision: &Decision) -
         &ledger.subject[..16],
         &decision.ledger_id[..16]
     ));
+    out
+}
+
+pub fn render_change_summary(
+    items: &[TransitionReportItem],
+    tampered_files: &[String],
+) -> String {
+    let total = items.len();
+    let unapproved_stops = items
+        .iter()
+        .filter(|i| i.decision.verdict == Verdict::Stop && i.approved_by.is_none())
+        .count();
+    let explained_count = items
+        .iter()
+        .filter(|i| i.decision.verdict == Verdict::Explained)
+        .count();
+    let read_count = items
+        .iter()
+        .filter(|i| i.decision.verdict == Verdict::Read)
+        .count();
+
+    let mut out = String::new();
+    if !tampered_files.is_empty() {
+        out.push_str(&format!(
+            "STOP  protected Assay files modified in PR: {}\n\n",
+            tampered_files.join(", ")
+        ));
+    }
+
+    out.push_str(&format!(
+        "Assay: {unapproved_stops} of {total} changed package(s) need a person\n\n"
+    ));
+
+    // Show stops first
+    for item in items
+        .iter()
+        .filter(|i| i.decision.verdict == Verdict::Stop && i.approved_by.is_none())
+    {
+        out.push_str(&render_explain_markdown(
+            &item.ledger,
+            &item.decision,
+            item.reading.as_ref(),
+            &item.route,
+            None,
+        ));
+        out.push('\n');
+    }
+
+    // Show approved stops & reads concisely
+    for item in items
+        .iter()
+        .filter(|i| i.decision.verdict == Verdict::Read || i.approved_by.is_some())
+    {
+        let label = if let Some(ref who) = item.approved_by {
+            format!("appr  {} -> {} (approved by {who})", item.ledger.name, item.ledger.new.version)
+        } else {
+            let summary = item
+                .reading
+                .as_ref()
+                .map(|r| r.summary.as_str())
+                .unwrap_or("reading passed");
+            format!(
+                "read  {} {} -> {}  ({summary})",
+                item.ledger.name,
+                item.ledger
+                    .reference
+                    .as_ref()
+                    .map(|r| r.version.as_str())
+                    .unwrap_or("(new)"),
+                item.ledger.new.version
+            )
+        };
+        out.push_str(&format!("{label}\n"));
+    }
+
+    if explained_count > 0 {
+        out.push_str(&format!("ok    {explained_count} package(s) fully explained\n"));
+    }
+    if read_count > 0 && explained_count == 0 && unapproved_stops == 0 {
+        out.push_str(&format!("ok    {read_count} package(s) read and passed\n"));
+    }
     out
 }
 

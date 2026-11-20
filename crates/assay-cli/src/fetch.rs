@@ -18,6 +18,7 @@ pub struct Fetcher {
 
 #[derive(Debug, Clone)]
 pub struct RegistryPackageDoc {
+    pub raw_bytes: Vec<u8>,
     pub raw_sha256: String,
     pub json: Value,
 }
@@ -46,7 +47,59 @@ impl Fetcher {
         let raw_sha256 = sha256_hex(&bytes);
         let json: Value = serde_json::from_slice(&bytes)
             .map_err(|e| format!("failed to parse registry json for {name}: {e}"))?;
-        Ok(RegistryPackageDoc { raw_sha256, json })
+        Ok(RegistryPackageDoc {
+            raw_bytes: bytes,
+            raw_sha256,
+            json,
+        })
+    }
+
+    pub fn read_cached_tarball(&self, sha512_hex: &str) -> Option<Vec<u8>> {
+        fs::read(self.cache_dir.join("tarballs").join(format!("{sha512_hex}.tgz"))).ok()
+    }
+
+    /// Selects the newest release strictly older than `new_version` that is settled
+    /// (published at least `settled_age_days` before `as_of`).
+    pub fn find_settled_reference_version(
+        &self,
+        doc: &Value,
+        new_version: &str,
+        as_of_rfc3339: &str,
+        settled_age_days: i64,
+    ) -> Option<String> {
+        let as_of_unix = parse_rfc3339_unix(as_of_rfc3339)?;
+        let cutoff = as_of_unix - settled_age_days * 86_400;
+        let time_map = doc.get("time")?.as_object()?;
+        let versions_map = doc.get("versions")?.as_object()?;
+        let new_pub = time_map
+            .get(new_version)
+            .and_then(|v| v.as_str())
+            .and_then(parse_rfc3339_unix);
+
+        let mut best: Option<(i64, String)> = None;
+        for ver in versions_map.keys() {
+            if ver == new_version || ver.contains('-') {
+                continue;
+            }
+            let Some(ts) = time_map
+                .get(ver)
+                .and_then(|v| v.as_str())
+                .and_then(parse_rfc3339_unix)
+            else {
+                continue;
+            };
+            if let Some(np) = new_pub {
+                if ts >= np {
+                    continue;
+                }
+            }
+            if ts <= cutoff {
+                if best.as_ref().map(|(bt, _)| ts > *bt).unwrap_or(true) {
+                    best = Some((ts, ver.clone()));
+                }
+            }
+        }
+        best.map(|(_, v)| v)
     }
 
     pub fn fetch_and_inspect_tarball(
@@ -286,34 +339,56 @@ impl Fetcher {
         }
 
         // Check for conflicts between anchor methods.
+        // Security ordering: Provenance > Tag (repo-backed) > GitHead (unsigned publisher metadata).
+        // Common release tools (`release-it`, `np`) publish before committing the version-bump tag,
+        // causing `gitHead` to lag `tag` by 1 commit. Prefer the stronger repo-backed anchor while
+        // recording the discrepancy; only hard-conflict when two repo-backed signals (Provenance vs Tag) disagree.
         let unique_commits: BTreeSet<String> = found_commits
             .iter()
             .map(|(_, c)| c.to_ascii_lowercase())
             .collect();
-        if unique_commits.len() > 1 {
-            let details = found_commits
+        let mut conflict_details: Vec<String> = Vec::new();
+        let chosen: Option<(AnchorMethod, String)> = if unique_commits.len() > 1 {
+            conflict_details = found_commits
                 .iter()
                 .map(|(m, c)| format!("{m:?}={c}"))
                 .collect();
-            return (
-                Anchor {
-                    found: false,
-                    commit: None,
-                    method: None,
-                    methods_tried,
-                    conflict: true,
-                    conflict_details: details,
-                    repository_url: repo_url,
-                    repository_directory: manifest.repository_directory.clone(),
-                    workflow_path: prov.as_ref().and_then(|p| p.workflow_path.clone()),
-                    workflow_ref: prov.as_ref().and_then(|p| p.workflow_ref.clone()),
-                    reachable_from_branch: None,
-                },
-                None,
-            );
-        }
+            let prov_commit = found_commits
+                .iter()
+                .find(|(m, _)| matches!(m, AnchorMethod::ProvenanceAsserted | AnchorMethod::ProvenanceVerified));
+            let tag_commit = found_commits
+                .iter()
+                .find(|(m, _)| *m == AnchorMethod::Tag);
 
-        let Some((method, commit)) = found_commits.into_iter().next() else {
+            match (prov_commit, tag_commit) {
+                (Some((_, pc)), Some((_, tc))) if !pc.eq_ignore_ascii_case(tc) => {
+                    // Hard conflict: SLSA provenance and repository tag point to different commits.
+                    return (
+                        Anchor {
+                            found: false,
+                            commit: None,
+                            method: None,
+                            methods_tried,
+                            conflict: true,
+                            conflict_details,
+                            repository_url: repo_url,
+                            repository_directory: manifest.repository_directory.clone(),
+                            workflow_path: prov.as_ref().and_then(|p| p.workflow_path.clone()),
+                            workflow_ref: prov.as_ref().and_then(|p| p.workflow_ref.clone()),
+                            reachable_from_branch: None,
+                        },
+                        None,
+                    );
+                }
+                (Some((pm, pc)), _) => Some((*pm, pc.clone())),
+                (None, Some((tm, tc))) => Some((*tm, tc.clone())),
+                (None, None) => found_commits.into_iter().next(),
+            }
+        } else {
+            found_commits.into_iter().next()
+        };
+
+        let Some((method, commit)) = chosen else {
             return (
                 Anchor {
                     found: false,
@@ -340,7 +415,7 @@ impl Fetcher {
                     method: Some(method),
                     methods_tried,
                     conflict: false,
-                    conflict_details: Vec::new(),
+                    conflict_details,
                     repository_url: None,
                     repository_directory: manifest.repository_directory.clone(),
                     workflow_path: prov.as_ref().and_then(|p| p.workflow_path.clone()),
@@ -383,7 +458,7 @@ impl Fetcher {
             method: Some(method),
             methods_tried,
             conflict: false,
-            conflict_details: Vec::new(),
+            conflict_details,
             repository_url: repo_url,
             repository_directory: pkg_dir,
             workflow_path: prov.as_ref().and_then(|p| p.workflow_path.clone()),
@@ -392,6 +467,84 @@ impl Fetcher {
         };
 
         (anchor, snapshot)
+    }
+
+    /// Best-effort fetch of commit subjects and a bounded unified source diff
+    /// between `from_commit` and `to_commit` for reading packet context.
+    #[allow(dead_code)]
+    pub fn fetch_commit_subjects_and_source_diff(
+        &self,
+        repo_url: &str,
+        from_commit: &str,
+        to_commit: &str,
+        pkg_dir: Option<&str>,
+    ) -> (Vec<String>, Option<String>) {
+        if !repo_url.starts_with("https://") || from_commit.eq_ignore_ascii_case(to_commit) {
+            return (Vec::new(), None);
+        }
+        let repo_key = sha256_hex(repo_url.as_bytes());
+        let repo_dir = self.cache_dir.join("git").join(&repo_key[..24]);
+        if !repo_dir.exists() {
+            return (Vec::new(), None);
+        }
+
+        // Shallow deepen slightly so commit range subjects are visible without pulling huge history.
+        let _ = run_git(
+            &repo_dir,
+            &[
+                "fetch",
+                "--no-tags",
+                "--filter=blob:none",
+                "--depth=50",
+                "origin",
+                to_commit,
+            ],
+        );
+
+        let range = format!("{from_commit}..{to_commit}");
+        let mut log_args = vec!["log", "--format=%s", "-n", "30", &range];
+        if let Some(dir) = pkg_dir {
+            if !dir.is_empty() {
+                log_args.push("--");
+                log_args.push(dir);
+            }
+        }
+        let subjects: Vec<String> = run_git(&repo_dir, &log_args)
+            .ok()
+            .map(|b| {
+                String::from_utf8_lossy(&b)
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Bounded source diff (max 24 KiB) for reader context on built files.
+        let mut diff_args = vec!["diff", "--unified=3", from_commit, to_commit];
+        if let Some(dir) = pkg_dir {
+            if !dir.is_empty() {
+                diff_args.push("--");
+                diff_args.push(dir);
+            }
+        }
+        let source_diff = run_git(&repo_dir, &diff_args).ok().and_then(|b| {
+            if b.is_empty() {
+                return None;
+            }
+            let s = String::from_utf8_lossy(&b);
+            if s.len() <= 24_000 {
+                Some(s.to_string())
+            } else {
+                let mut end = 24_000;
+                while !s.is_char_boundary(end) && end > 0 {
+                    end -= 1;
+                }
+                Some(format!("{}\n...[source diff truncated at 24 KiB]", &s[..end]))
+            }
+        });
+
+        (subjects, source_diff)
     }
 
     fn fetch_git_source_snapshot(

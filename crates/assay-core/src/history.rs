@@ -170,7 +170,11 @@ pub fn evaluate_history(
 
         let dropped: Vec<&str> = new_files
             .iter()
-            .filter(|f| f.class == OriginClass::Unexplained && ref_source_paths.contains(f.path.as_str()))
+            .filter(|f| {
+                f.class == OriginClass::Unexplained
+                    && !matches!(f.role, FileRole::Doc | FileRole::Declaration | FileRole::SourceMap)
+                    && ref_source_paths.contains(f.path.as_str())
+            })
             .map(|f| f.path.as_str())
             .collect();
 

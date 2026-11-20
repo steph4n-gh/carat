@@ -1,0 +1,125 @@
+# Drop-in GitHub Actions workflow for Assay pull request checks (SPEC section 10.3).
+# Runs strictly from the protected base revision (`pull_request_target`) without ever
+# executing PR head code. Maintainers approve stops by commenting:
+#   assay approve <subject>
+name: Assay Dependency Gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  assay:
+    if: >
+      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, 'assay approve '))
+    runs-on: ubuntu-latest
+    env:
+      ASSAY_VERSION: "0.1.0"
+      # Pin the SHA-256 of the official release binary here before enabling in production:
+      ASSAY_SHA256: "REPLACE_WITH_RELEASE_SHA256"
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - name: Checkout protected base revision (never executes PR head)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve PR refs and comments
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNum = context.eventName === 'pull_request_target'
+              ? context.payload.pull_request.number
+              : context.payload.issue.number;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNum,
+            });
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNum,
+            });
+            const out = [];
+            for (const c of comments) {
+              const perm = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: c.user.login,
+              });
+              const hasWrite = ['admin', 'maintain', 'write'].includes(perm.data.permission);
+              out.push({
+                author: c.user.login,
+                body: c.body || '',
+                has_write_access: hasWrite,
+                created_at: c.created_at,
+              });
+            }
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/pr-comments.json', JSON.stringify(out));
+            core.setOutput('number', String(prNum));
+            core.setOutput('base', pr.base.sha);
+            core.setOutput('head', pr.head.sha);
+            core.setOutput('author', pr.user.login);
+
+      - name: Fetch PR head commit objects only (no checkout)
+        run: |
+          git fetch --no-tags origin "pull/${{ steps.pr.outputs.number }}/head:refs/assay/pr-head"
+
+      - name: Build or verify pinned Assay binary
+        run: |
+          # Option A (pinned release archive):
+          # curl -fsSL -o assay.tar.gz "https://github.com/<org>/assay/releases/download/v${ASSAY_VERSION}/assay-x86_64-unknown-linux-gnu.tar.gz"
+          # echo "${ASSAY_SHA256}  assay.tar.gz" | sha256sum -c -
+          # tar -xzf assay.tar.gz
+          # Option B (source build):
+          cargo build --release --locked
+          cp target/release/assay ./assay
+
+      - name: Run Assay PR gate
+        id: run
+        continue-on-error: true
+        run: |
+          READ_FLAG=""
+          if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            READ_FLAG="--read"
+          fi
+          ./assay pr \
+            --base "${{ steps.pr.outputs.base }}" \
+            --head "refs/assay/pr-head" \
+            --comments-json /tmp/pr-comments.json \
+            --pr-author "${{ steps.pr.outputs.author }}" \
+            $READ_FLAG > /tmp/assay-summary.md
+          STATUS=$?
+          ./assay pr \
+            --base "${{ steps.pr.outputs.base }}" \
+            --head "refs/assay/pr-head" \
+            --comments-json /tmp/pr-comments.json \
+            --pr-author "${{ steps.pr.outputs.author }}" \
+            $READ_FLAG --json > /tmp/assay-report.json || true
+          cat /tmp/assay-summary.md
+          exit $STATUS
+
+      - name: Upload Assay artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: assay-report
+          path: |
+            /tmp/assay-summary.md
+            /tmp/assay-report.json
+
+      - name: Fail check if unapproved stops remain
+        if: steps.run.outcome != 'success'
+        run: exit 1

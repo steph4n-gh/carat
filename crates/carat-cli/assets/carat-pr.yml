@@ -24,8 +24,8 @@ jobs:
        startsWith(github.event.comment.body, 'carat approve '))
     runs-on: ubuntu-latest
     env:
-      CARAT_RELEASE_URL: "https://github.com/steph4n-gh/carat/releases/download/v0.1.0/carat-x86_64-unknown-linux-gnu.tar.gz"
-      CARAT_SHA256: "84f47a9bcebfcb44a7b666570e63b299800cbd63a0e8bedb6bb775227d785d3c"
+      CARAT_RELEASE_URL: "https://github.com/steph4n-gh/carat/releases/download/v0.1.1/carat-x86_64-unknown-linux-gnu.tar.gz"
+      CARAT_SHA256: "4397ace10987a2e5ea812bf32afba28cb716fc2fc177dc7659e290ebed0e7313"
     steps:
       - name: Checkout protected base revision (never executes PR head)
         uses: actions/checkout@v4

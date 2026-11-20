@@ -1,0 +1,36 @@
+# Assay configuration (read only from the protected base revision in `assay pr`)
+
+# Releases newer than min_age only pass if 100% deterministically explained.
+min_age = "24h"
+
+# Releases at least settled_age old (with no malicious advisory) do not hard-stop
+# on missing source anchors, though unexplained bytes are still read.
+settled_age = "30d"
+
+# Require human confirmation when adding a brand-new direct dependency ("confirm" | "check").
+new_direct_dependency = "confirm"
+
+# Whether transitions that pass the reader are allowed automatically ("allow" | "require_human").
+read_pass = "allow"
+
+# Number of independent reading passes (1, or 2 to require two passes with reversed unit order).
+readings = 1
+
+# Run the reader even on stopped transitions so reviewers get a concise summary.
+read_on_stop = true
+
+# Number of prior releases used to build each package's publishing habit profile.
+history_depth = 20
+
+# Optional additional read-only record stores (e.g. shared team cache).
+stores = []
+
+[reader]
+# Built-in Anthropic reader (uses ANTHROPIC_API_KEY env var):
+model = "claude-opus-5-5"
+effort = "high"
+timeout_secs = 90
+
+# Or plug in any external executable reading a ReadingPacket JSON on stdin
+# and writing findings JSON to stdout:
+# command = "/path/to/custom-reader"

@@ -2,104 +2,90 @@
 
 **A balance sheet for dependency changes.**
 
-When a project updates a dependency, it admits new bytes written by strangers. Almost nobody reads them because there is too much noise. Assay accounts for every changed byte between two versions of a package:
+Every time you—or a coding agent—run `npm install` or merge a dependency update PR, you admit new code written by strangers. The most common serious npm attack is a **stolen registry token**: an attacker publishes malicious code to npm that never existed in the public GitHub repository.
 
-1. **Carried** — identical bytes to the version you already have.
-2. **Source / SourceElsewhere / SourceNormalized** — SHA-256 verified against the public Git repository at the commit the release claims to be built from (found via SLSA provenance, tag, or `gitHead`), with explicit declared normalizations (`CRLF → LF` and benign `package.json` publish diffs).
-3. **Unexplained** — whatever is left. Unexplained diffs can be read by a structured reader (`--read`) whose findings are verified line-by-line against the actual bytes by the deterministic core.
+Assay checks **where every changed byte came from**:
+1. **Unchanged** from the version you already had (`Carried`) → ignored.
+2. **Identical to the public Git repository** at that release's commit (`Source`, `SourceElsewhere`, `SourceNormalized`) → accounted for, verified by SHA-256.
+3. **Leftover (`Unexplained`) bytes or broken publishing habits** (lost provenance, missing anchor, repo change, new `postinstall` script, new network/shell capabilities) → **stopped** or handed to a constrained AI reader (`--read`) that reads *only* the leftover diff.
 
-The governing rule is **nothing appears from nowhere**.
-
-> **Claims discipline:** Assay reports checkable facts and one of three verdicts (`explained`, `read`, `stop`). It **never** claims a package is safe or free of malware. An explained release can still be harmful if harm was committed openly to public source.
+> **Claims discipline:** Assay reports checkable facts and one of three verdicts (`explained`, `read`, `stop`). It **never** states or implies that a package is safe or free of malware. An explained release can still be harmful if harm was committed openly to public source.
 
 ---
 
-## Quickstart
+## Real Output (Live npm Transitions)
 
-Build the single binary (`rustc` 1.85+):
-
-```bash
-cargo build --release
+```text
+OK    chalk 6.0.0 -> 6.0.1
+      anchor: 47fc05abd461 via GitHead @ https://github.com/chalk/chalk
+      published: 54d ago (Settled)
+      balance: 2 changed file(s) (9.8 KiB), 100.0% explained | 10 carried (45.0 KiB)
+        - Source                2 file(s),   9.8 KiB
+      subject: 7ac2cded06cdc20a | ledger: 164da6d8dec49315
 ```
 
-### Explain a single npm transition (no project needed)
+On `zod 4.6.6 -> 4.6.7`, Assay accounted for **838 of 840 files (5.9 MiB)** automatically via carry-over + SLSA provenance monorepo matching, leaving only **866 bytes** (`versions.js` / `versions.cjs`) for the reader.
+
+---
+
+## Install (Single Binary)
 
 ```bash
-./target/release/assay explain chalk@6.0.0..6.0.1
-./target/release/assay explain zod@4.6.6..4.6.7
-./target/release/assay explain vite@8.3.7..8.3.8 --read
+./scripts/install.sh                  # builds & installs ~/.local/bin/assay
+./scripts/install.sh --install-skill  # also installs the coding-agent skill
 ```
 
-### Check a `package-lock.json` diff (lockfile v3)
+Requires Rust (`cargo`), `git`, and `curl`. Optional: set `ANTHROPIC_API_KEY` to enable the built-in `--read` AI diff reader (or configure any custom stdin/stdout reader in `assay.toml`).
+
+---
+
+## For Humans
+
+See **[docs/HUMAN-GUIDE.md](docs/HUMAN-GUIDE.md)** for the complete handbook (stop rules `S1`–`S10`, approving stops, PR workflows, incident response, and offline replay).
 
 ```bash
+# 1. Explain any npm update (no project needed)
+assay explain chalk@6.0.0..6.0.1
+assay explain vite@8.3.7..8.3.8 --read
+
+# 2. Bootstrap Assay in a repository (creates assay.toml + GitHub Actions PR workflow)
+assay init --github --mcp
+
+# 3. Check a dependency before installing it (runs npm --package-lock-only --ignore-scripts in a temp dir)
+assay add zod@4.6.7
+
+# 4. Check a package-lock.json diff (lockfile v3) or a Git PR (objects only, never executes PR head)
 assay check --base old/package-lock.json --head new/package-lock.json
-```
-
-### Gate a pull request strictly from Git objects
-
-```bash
 assay pr --base origin/main --head HEAD
-```
 
-Reads both revisions via `git show` (never executes PR head code), loads `assay.toml` only from `--base`, and hard-stops if the PR modifies `assay.toml` or `.github/workflows/*assay*.yml`. See [docs/workflows/assay-pr.yml](docs/workflows/assay-pr.yml).
+# 5. Approve a stop (bound to exact tarball bytes; auto-invalidates on S10 if new risks appear)
+assay approve 7ac2cded06cdc20a --note "reviewed diff"
 
-### Gate coding agents before `npm install`
-
-```bash
-assay add zod@4.6.7             # resolves full transitive tree in an isolated temp dir (--ignore-scripts)
-assay mcp                       # stdio JSON-RPC 2.0 MCP server (exposes explain/check/add, never approve)
-```
-
-See [docs/agent-hook.md](docs/agent-hook.md).
-
-### Approvals, exposure tracing, inventory, and offline replay
-
-```bash
-assay approve <subject-prefix> --note "reviewed diff"
+# 6. Incident response & offline verification
 assay exposure flatmap-stream@0.1.1 --repo .
-assay exposure --sha512 <hex-or-sri> --repo .
 assay inventory --lock package-lock.json
-assay explain chalk@6.0.0..6.0.1 --save-inputs
-assay replay .assay/inputs/<ledger-id>
+assay explain chalk@6.0.0..6.0.1 --save-inputs && assay replay .assay/inputs/<ledger-id>
 ```
 
 ---
 
-## Exit Codes
+## For Coding Agents
 
-| Code | Meaning |
-| --- | --- |
-| `0` | Every transition is `explained`, `read`, or `stop` with a valid human approval |
-| `1` | At least one unapproved `stop` (or protected policy/workflow edit) |
-| `2` | Operational error (bad input, config error, fetch failure) |
+See **[docs/AGENT-GUIDE.md](docs/AGENT-GUIDE.md)**, **[AGENTS.md](AGENTS.md)**, and the drop-in skill **[skills/assay/SKILL.md](skills/assay/SKILL.md)**.
+
+1. **MCP Server (`assay mcp`):** Run `assay init --mcp` to print the ready-to-paste MCP server config exposing `assay_explain`, `assay_check`, and `assay_add`. Agents **cannot** approve stops.
+2. **Pre-Install Shell Hook:** Point your agent's `PreToolUse` Bash hook at **[scripts/pre-install-hook.sh](scripts/pre-install-hook.sh)** to automatically gate every `npm install <pkg>` command.
+3. **Stable Machine CLI:** Every command accepts `--json` and uses strict exit codes (`0` = pass, `1` = unapproved stop, `2` = error).
 
 ---
 
-## Configuration (`assay.toml`)
+## Architecture & Docs
 
-```toml
-min_age = "24h"
-settled_age = "30d"
-new_direct_dependency = "confirm" # or "check"
-read_pass = "allow"               # or "require_human"
-readings = 1                      # set 2 for two independent reversed-order passes
-read_on_stop = true
-history_depth = 20
-stores = []
-
-[reader]
-model = "claude-opus-5-5"
-effort = "high"
-# command = "/path/to/custom-reader" # optional stdin/stdout JSON subprocess reader
-```
-
-Set `ANTHROPIC_API_KEY` to use the built-in Anthropic reader, or point `reader.command` at any program reading a `ReadingPacket` JSON on stdin and returning findings JSON on stdout (see [SPEC.md](SPEC.md)).
-
-## Architecture
-
-- **`crates/assay-core`** — deterministic, network-free core: strict in-memory PAX/USTAR streaming tar parser, SHA-256/SHA-512/Git-blob hashing, canonical JSON, lockfile v3 diff + shortest introducer routes, declared normalizations, habit-profile breaks, lexical reach scanner, unified-diff reading packet builder (with deterministic single-line minified splitting), verbatim-excerpt finding validator, and timeless `TransitionLedger` + `as_of` `Decision` evaluator.
-- **`crates/assay-cli`** — single `assay` binary: hardened `curl`/`git` object-only fetcher, built-in + pluggable reader executor, content-addressed `.assay/` store, PR gate, exposure tracer, offline replay, and stdio MCP server.
+- **[SPEC.md](SPEC.md)** — Full technical specification (draft 0.2), threat model, and validation protocol.
+- **[assay.toml.example](assay.toml.example)** — Documented policy & reader configuration template.
+- **[docs/workflows/assay-pr.yml](docs/workflows/assay-pr.yml)** — Drop-in GitHub Actions PR gate running strictly from the protected base branch.
+- **`crates/assay-core`** — Pure deterministic core (in-memory PAX/USTAR streaming tar parser, SHA-256/512/Git-blob hashing, lockfile v3 diff + routes, normalizations, habit breaks, reach scan, unified-diff packet builder, verbatim-excerpt validator, timeless ledgers + `as_of` decisions).
+- **`crates/assay-cli`** — Single `assay` binary (hardened `curl`/`git` fetch, built-in & pluggable reader, content-addressed `.assay/` store, PR gate, exposure tracer, offline replay, `init`, and stdio MCP server).
 
 ## License
 

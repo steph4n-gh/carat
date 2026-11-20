@@ -189,6 +189,22 @@ enum Commands {
 
     /// Run Assay's stdio JSON-RPC 2.0 MCP server for coding agents
     Mcp,
+
+    /// Bootstrap Assay in a project (writes assay.toml, optional GitHub workflow, and MCP snippet)
+    Init {
+        /// Target project directory (default: current directory)
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Also install .github/workflows/assay-pr.yml
+        #[arg(long)]
+        github: bool,
+        /// Print ready-to-paste MCP server JSON config for coding agents
+        #[arg(long)]
+        mcp: bool,
+        /// Overwrite existing files if present
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -337,7 +353,96 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Commands::Init {
+            dir,
+            github,
+            mcp,
+            force,
+        } => match run_init(&dir, github, mcp, force, cli.json) {
+            Ok(()) => ExitCode::from(0),
+            Err(e) => {
+                eprintln!("assay init error: {e}");
+                ExitCode::from(2)
+            }
+        },
     }
+}
+
+const DEFAULT_CONFIG_TOML: &str = include_str!("../../../assay.toml.example");
+const DEFAULT_GITHUB_WORKFLOW: &str = include_str!("../../../docs/workflows/assay-pr.yml");
+
+fn run_init(
+    dir: &Path,
+    github: bool,
+    mcp: bool,
+    force: bool,
+    json_output: bool,
+) -> Result<(), String> {
+    let mut created: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+
+    let cfg_path = dir.join("assay.toml");
+    if cfg_path.exists() && !force {
+        skipped.push(cfg_path.display().to_string());
+    } else {
+        fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        fs::write(&cfg_path, DEFAULT_CONFIG_TOML)
+            .map_err(|e| format!("write {}: {e}", cfg_path.display()))?;
+        created.push(cfg_path.display().to_string());
+    }
+
+    if github {
+        let wf_dir = dir.join(".github").join("workflows");
+        let wf_path = wf_dir.join("assay-pr.yml");
+        if wf_path.exists() && !force {
+            skipped.push(wf_path.display().to_string());
+        } else {
+            fs::create_dir_all(&wf_dir).map_err(|e| format!("mkdir {}: {e}", wf_dir.display()))?;
+            fs::write(&wf_path, DEFAULT_GITHUB_WORKFLOW)
+                .map_err(|e| format!("write {}: {e}", wf_path.display()))?;
+            created.push(wf_path.display().to_string());
+        }
+    }
+
+    let exe_path = std::env::current_exe()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "assay".to_string());
+    let mcp_config = json!({
+        "mcpServers": {
+            "assay": {
+                "command": exe_path,
+                "args": ["mcp"],
+                "env": {
+                    "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}"
+                }
+            }
+        }
+    });
+
+    if json_output {
+        let out = json!({
+            "created": created,
+            "skipped": skipped,
+            "mcp_config": mcp_config,
+        });
+        println!("{}", to_canonical_json(&out)?);
+    } else {
+        for p in &created {
+            println!("Created {p}");
+        }
+        for p in &skipped {
+            println!("Skipped {p} (already exists; pass --force to overwrite)");
+        }
+        if mcp {
+            println!("\nMCP config (paste into your coding agent settings):");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&mcp_config).unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn load_config(explicit: Option<&Path>) -> Result<AssayConfig, String> {

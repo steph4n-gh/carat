@@ -129,10 +129,14 @@ enum Commands {
         read: bool,
     },
 
-    /// Resolve, check, and optionally install an npm dependency (exact checked bytes only)
+    /// Resolve, check, and optionally install one or more npm dependencies (exact checked bytes only)
     Add {
-        /// Package specifier, e.g. zod or zod@4.6.7
-        package: String,
+        /// Package specifier(s), e.g. zod or react react-dom
+        #[arg(required = true)]
+        packages: Vec<String>,
+        /// Save to devDependencies (`npm install --save-dev`)
+        #[arg(short = 'D', long)]
+        dev: bool,
         /// Project directory containing package.json / package-lock.json
         #[arg(long, default_value = ".")]
         project_dir: PathBuf,
@@ -144,10 +148,11 @@ enum Commands {
         install: bool,
     },
 
-    /// Record a human approval bound to a transition subject and exact stop facts
+    /// Record human approval(s) bound to transition subject(s) and exact stop facts
     Approve {
-        /// Unique subject hex ID or prefix (>= 8 hex chars) from a stop report
-        subject: String,
+        /// One or more unique ledger/subject hex IDs or prefixes (>= 8 hex chars) from stop reports
+        #[arg(required = true)]
+        subjects: Vec<String>,
         /// Approver name (defaults to $USER)
         #[arg(long)]
         by: Option<String>,
@@ -286,11 +291,12 @@ fn main() -> ExitCode {
             }
         },
         Commands::Add {
-            package,
+            packages,
+            dev,
             project_dir,
             read,
             install,
-        } => match execute_add(&package, &project_dir, read, install, &store_root, &cfg) {
+        } => match execute_add(&packages, dev, &project_dir, read, install, &store_root, &cfg) {
             Ok(res) => {
                 if let Err(e) = emit_change_report(
                     &res.items,
@@ -317,11 +323,11 @@ fn main() -> ExitCode {
             }
         },
         Commands::Approve {
-            subject,
+            subjects,
             by,
             note,
             non_interactive,
-        } => match run_approve(&subject, by, note, non_interactive, &store_root, &cfg, cli.json) {
+        } => match run_approve(&subjects, by, note, non_interactive, &store_root, &cfg, cli.json) {
             Ok(()) => ExitCode::from(0),
             Err(e) => {
                 eprintln!("carat error: {e}");
@@ -1552,14 +1558,20 @@ struct AddResult {
 
 /// Shared "resolve once, check once, install those exact bytes" engine used by BOTH CLI and MCP!
 fn execute_add(
-    package: &str,
+    packages: &[String],
+    dev: bool,
     project_dir: &Path,
     read: bool,
     install: bool,
     store_root: &Path,
     cfg: &CaratConfig,
 ) -> Result<AddResult, String> {
-    validate_npm_package_spec(package)?;
+    if packages.is_empty() {
+        return Err("at least one package specifier is required".into());
+    }
+    for pkg in packages {
+        validate_npm_package_spec(pkg)?;
+    }
     let as_of = now_rfc3339();
 
     if project_dir.join("npm-shrinkwrap.json").exists() {
@@ -1619,18 +1631,24 @@ fn execute_add(
     }
 
     // Resolve ONCE in private isolated temp dir with scripts, user/global npmrc, and git disabled (`--` prevents flag injection).
+    let mut npm_args: Vec<&str> = vec![
+        "install",
+        "--package-lock-only",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        &user_rc_arg,
+        &global_rc_arg,
+    ];
+    if dev {
+        npm_args.push("--save-dev");
+    }
+    npm_args.push("--");
+    for pkg in packages {
+        npm_args.push(pkg.as_str());
+    }
     let npm_out = scrubbed_npm_command(tmp_dir)
-        .args([
-            "install",
-            "--package-lock-only",
-            "--ignore-scripts",
-            "--no-audit",
-            "--no-fund",
-            &user_rc_arg,
-            &global_rc_arg,
-            "--",
-            package,
-        ])
+        .args(&npm_args)
         .output()
         .map_err(|e| format!("failed spawning npm: {e}"))?;
 
@@ -1744,7 +1762,7 @@ fn execute_add(
 }
 
 fn run_approve(
-    subject_query: &str,
+    subject_queries: &[String],
     by: Option<String>,
     note: Option<String>,
     non_interactive: bool,
@@ -1757,53 +1775,71 @@ fn run_approve(
             "carat approve requires an interactive human terminal (refusing non-TTY agent call; humans scripting approvals may pass --non-interactive)".into(),
         );
     }
+    if subject_queries.is_empty() {
+        return Err("at least one approval subject/ledger ID is required".into());
+    }
 
     let store = open_store(store_root, cfg)?;
-    let (ledger_id, ledger) = store.find_unique_ledger_for_subject(subject_query)?;
+
+    // Resolve and validate every requested ID upfront before writing any approval record.
+    let mut resolved = Vec::with_capacity(subject_queries.len());
+    for q in subject_queries {
+        resolved.push(store.find_unique_ledger_for_subject(q)?);
+    }
 
     let now = now_rfc3339();
-    let approved_facts = match store.load_decision_for_subject(&ledger.subject) {
-        Some(prev_dec) => prev_dec.stop_facts,
-        None => evaluate_decision(
-            &ledger,
-            &ledger_id,
-            &cfg.policy,
-            &now,
-            false,
-            ReadingOutcome::NotRun,
-            None,
-        )
-        .stop_facts,
-    };
-
     let approver = by
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "human".to_string());
 
-    let approval = ApprovalRecord {
-        kind: "approval".to_string(),
-        schema: 2,
-        subject: ledger.subject.clone(),
-        ledger_id,
-        approved_facts,
-        approver,
-        approved_at: now,
-        note,
-    };
+    let mut saved = Vec::with_capacity(resolved.len());
+    for (ledger_id, ledger) in resolved {
+        let approved_facts = match store.load_decision_for_subject(&ledger.subject) {
+            Some(prev_dec) => prev_dec.stop_facts,
+            None => evaluate_decision(
+                &ledger,
+                &ledger_id,
+                &cfg.policy,
+                &now,
+                false,
+                ReadingOutcome::NotRun,
+                None,
+            )
+            .stop_facts,
+        };
 
-    let saved_path = store.save_approval(&approval)?;
+        let approval = ApprovalRecord {
+            kind: "approval".to_string(),
+            schema: 2,
+            subject: ledger.subject.clone(),
+            ledger_id,
+            approved_facts,
+            approver: approver.clone(),
+            approved_at: now.clone(),
+            note: note.clone(),
+        };
+
+        let saved_path = store.save_approval(&approval)?;
+        if !json_output {
+            println!(
+                "Approved {} ({} -> {}) by {} for {} fact(s) -> {}",
+                &approval.subject[..16],
+                ledger.name,
+                ledger.new.version,
+                approval.approver,
+                approval.approved_facts.len(),
+                saved_path.display()
+            );
+        }
+        saved.push(approval);
+    }
+
     if json_output {
-        println!("{}", to_canonical_json(&approval)?);
-    } else {
-        println!(
-            "Approved {} ({} -> {}) by {} for {} fact(s) -> {}",
-            &approval.subject[..16],
-            ledger.name,
-            ledger.new.version,
-            approval.approver,
-            approval.approved_facts.len(),
-            saved_path.display()
-        );
+        if saved.len() == 1 {
+            println!("{}", to_canonical_json(&saved[0])?);
+        } else {
+            println!("{}", to_canonical_json(&saved)?);
+        }
     }
     Ok(())
 }
@@ -2267,7 +2303,13 @@ impl McpDispatcher for CliMcpDispatcher {
                     .get("install")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let res = execute_add(pkg, &project_dir, read, install, &self.store_root, &self.cfg)?;
+                let dev = arguments
+                    .get("dev")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let pkgs = vec![pkg.to_string()];
+                let res =
+                    execute_add(&pkgs, dev, &project_dir, read, install, &self.store_root, &self.cfg)?;
                 let mut report = change_report_json(&res.items, &[], &res.transition_errors, res.passed);
                 if let Some(obj) = report.as_object_mut() {
                     obj.insert("installed".into(), Value::Bool(res.installed));
@@ -2431,5 +2473,51 @@ mod tests {
             "forged-pkg",
             Some("1.0.0"),
         ));
+    }
+
+    #[test]
+    fn cli_parses_add_dev_multi_packages_and_multi_approve_ids() {
+        let cli = Cli::try_parse_from([
+            "carat",
+            "add",
+            "-D",
+            "vite",
+            "typescript@5.9.3",
+            "--install",
+        ])
+        .expect("parse add -D multi-pkg");
+        match cli.command {
+            Commands::Add {
+                packages,
+                dev,
+                install,
+                ..
+            } => {
+                assert_eq!(packages, vec!["vite", "typescript@5.9.3"]);
+                assert!(dev);
+                assert!(install);
+            }
+            _ => panic!("expected Add"),
+        }
+
+        let cli2 = Cli::try_parse_from([
+            "carat",
+            "approve",
+            "eb5ab4cb2a2c7399",
+            "222723f80feda9f4",
+            "--non-interactive",
+        ])
+        .expect("parse multi-id approve");
+        match cli2.command {
+            Commands::Approve {
+                subjects,
+                non_interactive,
+                ..
+            } => {
+                assert_eq!(subjects, vec!["eb5ab4cb2a2c7399", "222723f80feda9f4"]);
+                assert!(non_interactive);
+            }
+            _ => panic!("expected Approve"),
+        }
     }
 }

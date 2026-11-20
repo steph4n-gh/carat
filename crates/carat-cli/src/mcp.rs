@@ -172,6 +172,7 @@ pub fn mcp_tools_schema() -> Value {
                 "required": ["package"],
                 "properties": {
                     "package": { "type": "string", "description": "Package specifier like zod or zod@4.6.7" },
+                    "dev": { "type": "boolean", "description": "Save to devDependencies (--save-dev, default: false)" },
                     "project_dir": { "type": "string", "description": "Project directory containing package.json / package-lock.json (default: current directory)" },
                     "read": { "type": "boolean", "description": "Run the configured reader on unexplained code diffs" },
                     "install": { "type": "boolean", "description": "When true and all transitions pass, write the exact checked lockfile and run npm ci --ignore-scripts (default: false)" }

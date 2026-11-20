@@ -27,8 +27,10 @@ echo "Building Carat (release)..."
 cargo build --release --manifest-path "${REPO_ROOT}/Cargo.toml"
 
 mkdir -p "$BIN_DIR"
-cp "${REPO_ROOT}/target/release/carat" "${BIN_DIR}/carat"
-chmod +x "${BIN_DIR}/carat"
+TMP_BIN="${BIN_DIR}/.carat.tmp.$$"
+cp "${REPO_ROOT}/target/release/carat" "$TMP_BIN"
+chmod +x "$TMP_BIN"
+mv -f "$TMP_BIN" "${BIN_DIR}/carat"
 echo "Installed: ${BIN_DIR}/carat ($("${BIN_DIR}/carat" --version))"
 
 if [[ ":$PATH:" != *":${BIN_DIR}:"* ]]; then

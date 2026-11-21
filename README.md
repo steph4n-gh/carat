@@ -104,8 +104,12 @@ Pass `--read` with `ANTHROPIC_API_KEY` set (or an external `reader.command` conf
 Install [docs/workflows/carat-pr.yml](docs/workflows/carat-pr.yml). The workflow runs on `pull_request_target`, checks out only the protected base revision, reads PR lockfiles strictly from Git object storage, and posts a single summary comment. Maintainers approve stops by commenting a single standalone line:
 
 ```text
-carat approve <16-hex-ledger-id>
+carat approve <16-hex-ledger-id> [<16-hex-ledger-id> ...]
 ```
+
+### Inspect visually in the browser (`carat-lens`)
+
+For a local read-only web UI over `.carat/` ledgers, Git lockfile diffs, live `carat explain` residual diffs, lockfile inventory, and batch approval commands, see the companion dashboard: [steph4n-gh/carat-lens](https://github.com/steph4n-gh/carat-lens) (built and gated end-to-end with Carat).
 
 ### Wire Carat into coding agents
 
